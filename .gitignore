@@ -210,3 +210,12 @@ __marimo__/
 cookies.json
 .mfp_mcp/
 *.mfp_mcp
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

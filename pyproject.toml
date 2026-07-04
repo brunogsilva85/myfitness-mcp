@@ -1,77 +1,57 @@
+[project]
+name = "myfitnesspal-mcp-service"
+dynamic = ["version"]
+description = "Deployable MyFitnessPal MCP server (remote Claude connector) - food diary, exercises, measurements, and nutrition goals"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+authors = [
+    {name = "Andrew Doering"},
+    {name = "Adam"},
+]
+dependencies = [
+    "mcp>=1.9.0,<2.0.0",
+    "myfitnesspal>=2.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+keywords = ["myfitnesspal", "mcp", "nutrition", "fitness", "health", "diet", "tracking", "claude"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[project]
-name = "mfp-mcp"
-version = "1.0.0"
-description = "MCP Server for MyFitnessPal - track food diary, exercises, measurements, and nutrition goals"
-readme = "README.md"
-license = "MIT"
-requires-python = ">=3.10"
-authors = [
-    { name = "Adam" }
-]
-keywords = [
-    "mcp",
-    "myfitnesspal",
-    "nutrition",
-    "fitness",
-    "health",
-    "diet",
-    "tracking",
-    "claude",
-    "anthropic"
-]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Medical Science Apps.",
-]
-dependencies = [
-    "mcp>=1.0.0",
-    "myfitnesspal>=2.0.0",
-    "pydantic>=2.0.0",
-    "httpx>=0.24.0",
-    "browser-cookie3>=0.19.0",
-    "pint>=0.22",
-    "keyring>=24.0.0",
-]
+[tool.hatch.version]
+path = "src/myfitnesspal_mcp/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/myfitnesspal_mcp"]
+
+[project.scripts]
+myfitnesspal-mcp-service = "myfitnesspal_mcp:main"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "black>=23.0.0",
-    "isort>=5.12.0",
-    "mypy>=1.0.0",
-    "ruff>=0.1.0",
+    "ipython",
+    "ipdb",
+    "ipykernel",
+    "mcp[cli]",
+    "pytest",
+    "pytest-asyncio",
+]
+linting = [
+    "ruff",
+    "mypy",
+    "types-requests",
 ]
 
-[project.scripts]
-mfp-mcp = "mfp_mcp.server:main"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/mfp_mcp"]
-
-[tool.black]
-line-length = 100
-target-version = ["py310", "py311", "py312"]
-
-[tool.isort]
-profile = "black"
-line_length = 100
-
-[tool.ruff]
-line-length = 100
-target-version = "py310"
-
-[tool.mypy]
-python_version = "3.10"
-warn_return_any = true
-warn_unused_ignores = true
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

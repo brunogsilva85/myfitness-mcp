@@ -1,42 +1,42 @@
-# MyFitnessPal MCP Server
-# 
-# NOTE: This MCP uses browser cookie authentication by default.
-# For Docker deployment, you'll need to mount your browser's cookie database
-# or use an alternative authentication method.
-#
-# Build: docker build -t mfp-mcp .
-# Run: docker run -it --rm -v ~/.config/google-chrome:/root/.config/google-chrome:ro mfp-mcp
+FROM python:3.13-slim
 
-FROM python:3.12-slim
-
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Install uv for fast dependency installation
+RUN pip install --no-cache-dir uv
 
 # Copy project files
 COPY pyproject.toml README.md ./
-COPY src/ ./src/
+COPY src/ src/
 
-# Install the package
-RUN pip install --no-cache-dir -e .
+# Install the package and dependencies (non-editable for Docker)
+RUN uv pip install --system .
 
 # Create non-root user for security
-RUN useradd --create-home --shell /bin/bash mcp
-USER mcp
+RUN useradd --create-home --shell /bin/bash --uid 1000 mcpuser
 
-# Expose default port (for HTTP transport if needed)
+# Mount point for a (read-only) Firefox profile containing a logged-in
+# myfitnesspal.com session; see MFP_FIREFOX_PROFILE_DIR in the README.
+RUN mkdir -p /profile && chown mcpuser:mcpuser /profile
+
+# Copy and set up entrypoint script
+COPY entrypoint.sh /app/
+RUN chmod +x /app/entrypoint.sh
+
+USER mcpuser
+
+# Expose MCP HTTP port
 EXPOSE 8000
 
-# Default command runs the MCP server with stdio transport
-ENTRYPOINT ["python", "-m", "mfp_mcp.server"]
+# Configure for HTTP transport
+ENV MCP_TRANSPORT=streamable-http \
+    MCP_HOST=0.0.0.0 \
+    MCP_PORT=8000 \
+    MFP_FIREFOX_PROFILE_DIR=/profile
+
+# Health check - verify the port is accepting connections
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import socket,sys; s=socket.socket(); s.settimeout(5); r=s.connect_ex(('localhost',8000)); s.close(); sys.exit(0 if r==0 else 1)"
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python", "-m", "myfitnesspal_mcp.server"]

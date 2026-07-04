@@ -1,31 +1,40 @@
-"""
-MyFitnessPal MCP Server
+"""MyFitnessPal MCP Server - Main entry point.
 
 A Model Context Protocol (MCP) server that provides tools for interacting
 with MyFitnessPal data including food diary, exercises, measurements, goals,
 water intake, and food search.
 
-Authentication Methods (in order of priority):
-1. Environment variables: MFP_USERNAME and MFP_PASSWORD
-2. Stored session cookies: ~/.mfp_mcp/cookies.json
-3. Browser cookies: Chrome/Firefox (fallback)
+Tool implementations are ported from AdamWalt/myfitnesspal-mcp-python (MIT).
+The OAuth 2.1 / transport skeleton (streamable-http, single-passcode OAuth
+provider, allowed-hosts DNS-rebinding protection) mirrors garmin-mcp-service
+so this can be used as a remote Claude connector.
+
+Authentication: MyFitnessPal's login page is captcha-protected, so password
+login is not supported. Session cookies are read from a mounted Firefox
+profile (MFP_FIREFOX_PROFILE_DIR) or a JSON cookies file (MFP_COOKIES_FILE) -
+see cookie_loader.
 """
 
 import json
 import logging
 import os
 import sys
-from datetime import date, datetime, timedelta
-from http.cookiejar import CookieJar, Cookie
-from pathlib import Path
-from typing import Optional, Dict, Any, List
-from enum import Enum
+import threading
 from collections import OrderedDict
-import time
+from datetime import date, datetime, timedelta
+from enum import Enum
+from http.cookiejar import CookieJar
+from typing import Any, Dict, Optional
 
-import httpx
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse, Response
+
+from . import cookie_loader
+from .oauth_provider import SinglePasscodeOAuthProvider
 
 # Configure logging to stderr (required for stdio transport)
 logging.basicConfig(
@@ -33,269 +42,171 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stderr)],
 )
-logger = logging.getLogger("mfp_mcp")
+logger = logging.getLogger("myfitnesspal_mcp")
+
+
+# Configure transport security based on mode
+# When running in HTTP mode (0.0.0.0), we need to either disable DNS rebinding
+# protection or configure allowed hosts via MCP_ALLOWED_HOSTS env var
+def _get_transport_security() -> TransportSecuritySettings | None:
+    """Get transport security settings based on environment."""
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport != "streamable-http":
+        return None  # Use FastMCP defaults for stdio
+
+    # Check for explicitly configured allowed hosts
+    allowed_hosts_str = os.getenv("MCP_ALLOWED_HOSTS", "")
+    if allowed_hosts_str:
+        allowed_hosts = [h.strip() for h in allowed_hosts_str.split(",") if h.strip()]
+        # Also allow localhost for local testing
+        allowed_hosts.extend(["127.0.0.1:*", "localhost:*", "[::1]:*"])
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=[],  # Allow any origin (MCP clients aren't browsers)
+        )
+
+    # No allowed hosts configured - disable DNS rebinding protection for remote access
+    return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
+# Configure OAuth for remote MCP connectors (Claude, ChatGPT), which require
+# full OAuth 2.1 + dynamic client registration rather than a bare bearer
+# token. Gated behind MCP_OAUTH_PASSCODE/MCP_RESOURCE_URL so local stdio use
+# and simple Docker testing don't need to set any of this up.
+def _build_oauth() -> tuple[SinglePasscodeOAuthProvider | None, AuthSettings | None]:
+    """Build the OAuth provider/settings pair, or (None, None) if unconfigured."""
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport != "streamable-http":
+        return None, None
+
+    passcode = os.getenv("MCP_OAUTH_PASSCODE")
+    resource_url = os.getenv("MCP_RESOURCE_URL")
+    if not passcode or not resource_url:
+        logging.getLogger(__name__).warning(
+            "MCP_TRANSPORT=streamable-http but MCP_OAUTH_PASSCODE/MCP_RESOURCE_URL "
+            "are not both set - running WITHOUT OAuth. Do not expose this "
+            "deployment to the internet until both are configured."
+        )
+        return None, None
+
+    provider = SinglePasscodeOAuthProvider(passcode)
+    auth_settings = AuthSettings(
+        issuer_url=resource_url,
+        resource_server_url=resource_url,
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True, valid_scopes=["mcp"], default_scopes=["mcp"]
+        ),
+        required_scopes=["mcp"],
+    )
+    return provider, auth_settings
+
+
+_oauth_provider, _auth_settings = _build_oauth()
 
 # Initialize MCP server
-mcp = FastMCP("myfitnesspal_mcp")
+mcp = FastMCP(
+    "MyFitnessPal MCP",
+    dependencies=["myfitnesspal", "httpx"],
+    host=os.getenv("MCP_HOST", "127.0.0.1"),
+    port=int(os.getenv("MCP_PORT", "8000")),
+    transport_security=_get_transport_security(),
+    auth=_auth_settings,
+    auth_server_provider=_oauth_provider,
+)
 
-# Configuration paths
-CONFIG_DIR = Path.home() / ".mfp_mcp"
-COOKIES_FILE = CONFIG_DIR / "cookies.json"
+_LOGIN_FORM = """
+<!doctype html>
+<html>
+<head><title>MyFitnessPal MCP - Sign in</title></head>
+<body style="font-family: sans-serif; max-width: 24rem; margin: 4rem auto;">
+  <h2>MyFitnessPal MCP</h2>
+  <p>{message}</p>
+  <form method="post">
+    <input type="hidden" name="login_id" value="{login_id}">
+    <input type="password" name="passcode" placeholder="Passcode" autofocus
+           style="width: 100%; padding: 0.5rem; font-size: 1rem;">
+    <button type="submit" style="margin-top: 0.75rem; padding: 0.5rem 1rem;">Continue</button>
+  </form>
+</body>
+</html>
+"""
+
+
+if _oauth_provider is not None:
+
+    @mcp.custom_route("/login", methods=["GET", "POST"])
+    async def login(request: Request) -> Response:
+        """Passcode gate standing in for a real login screen (see oauth_provider)."""
+        if request.method == "GET":
+            login_id = request.query_params.get("login_id", "")
+        else:
+            form = await request.form()
+            login_id = str(form.get("login_id", ""))
+
+        if not login_id or _oauth_provider.get_pending(login_id) is None:
+            return HTMLResponse(
+                _LOGIN_FORM.format(message="This login link has expired. Please retry from your MCP client.", login_id=""),
+                status_code=400,
+            )
+
+        if request.method == "GET":
+            return HTMLResponse(_LOGIN_FORM.format(message="Enter the server passcode to continue.", login_id=login_id))
+
+        form = await request.form()
+        passcode = str(form.get("passcode", ""))
+        if not _oauth_provider.verify_passcode(passcode):
+            return HTMLResponse(
+                _LOGIN_FORM.format(message="Incorrect passcode, try again.", login_id=login_id),
+                status_code=401,
+            )
+
+        redirect_url = _oauth_provider.complete_login(login_id)
+        if redirect_url is None:
+            return HTMLResponse(
+                _LOGIN_FORM.format(message="This login link has expired. Please retry from your MCP client.", login_id=""),
+                status_code=400,
+            )
+        return RedirectResponse(redirect_url, status_code=302)
 
 
 # ============================================================================
-# Authentication Helper Functions
+# Authentication
 # ============================================================================
 
-
-def ensure_config_dir():
-    """Ensure the config directory exists."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def save_cookies(cookies: Dict[str, str]):
-    """
-    Save session cookies to file for persistence.
-    
-    Args:
-        cookies: Dictionary of cookie name -> value
-    """
-    ensure_config_dir()
-    cookie_data = {
-        "cookies": cookies,
-        "saved_at": datetime.now().isoformat(),
-    }
-    with open(COOKIES_FILE, "w") as f:
-        json.dump(cookie_data, f, indent=2)
-    logger.info(f"Saved session cookies to {COOKIES_FILE}")
-
-
-def load_cookies() -> Optional[Dict[str, str]]:
-    """
-    Load session cookies from file.
-    
-    Returns:
-        Dictionary of cookies if file exists and is valid, None otherwise
-    """
-    if not COOKIES_FILE.exists():
-        return None
-    
-    try:
-        with open(COOKIES_FILE, "r") as f:
-            cookie_data = json.load(f)
-        
-        # Check if cookies are less than 30 days old
-        saved_at = datetime.fromisoformat(cookie_data.get("saved_at", "2000-01-01"))
-        if datetime.now() - saved_at > timedelta(days=30):
-            logger.info("Stored cookies are expired (>30 days old)")
-            return None
-        
-        return cookie_data.get("cookies")
-    except Exception as e:
-        logger.warning(f"Failed to load cookies: {e}")
-        return None
-
-
-def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal.com") -> CookieJar:
-    """
-    Convert a dictionary of cookies to a CookieJar that can be used by myfitnesspal.Client.
-    
-    Args:
-        cookies_dict: Dictionary of cookie name -> value
-        domain: Domain for the cookies (default: .myfitnesspal.com)
-    
-    Returns:
-        CookieJar: A CookieJar object populated with the cookies
-    """
-    jar = CookieJar()
-    
-    for name, value in cookies_dict.items():
-        cookie = Cookie(
-            version=0,
-            name=name,
-            value=value,
-            port=None,
-            port_specified=False,
-            domain=domain,
-            domain_specified=True,
-            domain_initial_dot=domain.startswith('.'),
-            path="/",
-            path_specified=True,
-            secure=True,
-            expires=int(time.time()) + 86400 * 30,  # 30 days from now
-            discard=False,
-            comment=None,
-            comment_url=None,
-            rest={"HttpOnly": None},
-            rfc2109=False,
-        )
-        jar.set_cookie(cookie)
-    
-    return jar
-
-
-def authenticate_with_credentials(username: str, password: str) -> Dict[str, str]:
-    """
-    Authenticate with MyFitnessPal using username/password.
-    
-    Args:
-        username: MyFitnessPal username or email
-        password: MyFitnessPal password
-    
-    Returns:
-        Dictionary of session cookies
-        
-    Raises:
-        RuntimeError: If authentication fails
-    """
-    # Log authentication attempt without exposing the username
-    logger.info("Authenticating with credentials")
-    
-    # MyFitnessPal login URL and endpoints
-    LOGIN_URL = "https://www.myfitnesspal.com/account/login"
-    
-    try:
-        with httpx.Client(follow_redirects=True, timeout=30.0) as client:
-            # First, get the login page to obtain CSRF token
-            response = client.get(LOGIN_URL)
-            response.raise_for_status()
-            
-            # Extract CSRF token from cookies or page
-            cookies = dict(response.cookies)
-            
-            # Attempt login
-            login_data = {
-                "username": username,
-                "password": password,
-            }
-            
-            # Try the standard form login
-            login_response = client.post(
-                LOGIN_URL,
-                data=login_data,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": LOGIN_URL,
-                },
-            )
-            
-            # Check if login was successful by looking for session cookies
-            all_cookies = dict(client.cookies)
-            
-            # MFP uses various session cookie names
-            session_indicators = ["user", "session", "auth", "logged_in"]
-            has_session = any(
-                any(indicator in name.lower() for indicator in session_indicators)
-                for name in all_cookies.keys()
-            )
-            
-            if has_session or len(all_cookies) > len(cookies):
-                logger.info("Successfully authenticated with credentials")
-                return all_cookies
-            else:
-                # Try to check if we can access authenticated content
-                test_response = client.get("https://www.myfitnesspal.com/food/diary")
-                if test_response.status_code == 200 and "login" not in str(test_response.url).lower():
-                    return dict(client.cookies)
-                    
-                raise RuntimeError("Login appeared to fail - no session cookies received")
-                
-    except httpx.HTTPError as e:
-        raise RuntimeError(f"HTTP error during authentication: {e}")
-    except Exception as e:
-        raise RuntimeError(f"Authentication failed: {e}")
+_client_lock = threading.Lock()
+_cached_client: Any = None
+_cached_jar: Optional[CookieJar] = None
 
 
 def get_mfp_client():
     """
     Get an authenticated MyFitnessPal client.
-    
-    Authentication is attempted in this order:
-    1. Environment variables (MFP_USERNAME, MFP_PASSWORD)
-    2. Stored session cookies (~/.mfp_mcp/cookies.json)
-    3. Browser cookies (Chrome/Firefox)
+
+    Session cookies are loaded via cookie_loader (Firefox profile mount or
+    JSON cookies file). The client is cached and only rebuilt when the
+    underlying cookie source changes (cookie_loader returns the same jar
+    object while the source file is unchanged).
 
     Returns:
         myfitnesspal.Client: Authenticated client instance
 
     Raises:
-        RuntimeError: If all authentication methods fail
+        RuntimeError: If no cookie source is configured or readable
     """
     import myfitnesspal
-    
-    last_error = None
-    
-    # Method 1: Try environment variable credentials
-    username = os.environ.get("MFP_USERNAME")
-    password = os.environ.get("MFP_PASSWORD")
-    
-    if username and password:
-        logger.info("Attempting authentication with environment credentials")
-        
-        # First check if we have valid stored cookies from a previous credential auth
-        stored_cookies = load_cookies()
-        if stored_cookies:
-            logger.info("Found stored session cookies, testing validity...")
-            try:
-                cookiejar = dict_to_cookiejar(stored_cookies)
-                client = myfitnesspal.Client(cookiejar=cookiejar)
-                # Test the connection
-                _ = client.get_date(date.today())
-                logger.info("Stored cookies are valid")
-                return client
-            except Exception as e:
-                logger.info(f"Stored cookies invalid: {e}, re-authenticating...")
-        
-        # Authenticate with credentials and save cookies
-        try:
-            cookies = authenticate_with_credentials(username, password)
-            save_cookies(cookies)
-            
-            # Create client with the new cookies
-            cookiejar = dict_to_cookiejar(cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            # Test the connection
-            _ = client.get_date(date.today())
-            logger.info("Successfully authenticated with credentials")
-            return client
-            
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Credential authentication failed: {e}")
-            # Fall through to other methods
-    
-    # Method 2: Try stored session cookies (without credential auth)
-    stored_cookies = load_cookies()
-    if stored_cookies:
-        logger.info("Attempting authentication with stored cookies")
-        try:
-            cookiejar = dict_to_cookiejar(stored_cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            # Test the connection
-            _ = client.get_date(date.today())
-            logger.info("Successfully authenticated with stored cookies")
-            return client
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Stored cookie authentication failed: {e}")
-    
-    # Method 3: Try browser cookies (default behavior)
-    logger.info("Attempting authentication with browser cookies")
-    try:
-        client = myfitnesspal.Client()
-        # Test the connection
-        _ = client.get_date(date.today())
-        logger.info("Successfully authenticated with browser cookies")
+
+    global _cached_client, _cached_jar
+
+    jar = cookie_loader.get_cookiejar()
+    with _client_lock:
+        if _cached_client is not None and _cached_jar is jar:
+            return _cached_client
+        logger.info("Building MyFitnessPal client from cookie jar (%d cookies)", len(jar))
+        client = myfitnesspal.Client(cookiejar=jar)
+        _cached_client = client
+        _cached_jar = jar
         return client
-    except Exception as e:
-        last_error = e
-        raise RuntimeError(
-            f"All authentication methods failed. Last error: {str(last_error)}\n\n"
-            "Please try one of these solutions:\n"
-            "1. Set MFP_USERNAME and MFP_PASSWORD environment variables in Claude Desktop config\n"
-            "2. Log into myfitnesspal.com in Chrome or Firefox\n"
-            "3. Check ~/.mfp_mcp/cookies.json for stored session"
-        )
 
 
 # ============================================================================
@@ -695,7 +606,7 @@ def add_food_to_diary(
 ) -> None:
     """
     Add a food item to the diary for a specific date and meal.
-    
+
     Args:
         client: Authenticated myfitnesspal.Client instance
         mfp_id: MyFitnessPal food item ID
@@ -703,12 +614,12 @@ def add_food_to_diary(
         target_date: Date to add the food entry
         quantity: Number of servings (default 1.0)
         unit: Optional unit/serving size description
-    
+
     Raises:
         RuntimeError: If the operation fails
     """
     from urllib import parse
-    
+
     try:
         # Get the diary page for the target date to extract CSRF token
         # Use the same method the library uses
@@ -717,10 +628,10 @@ def add_food_to_diary(
             client.BASE_URL_SECURE,
             f"food/diary/{client.effective_username}?date={date_str}"
         )
-        
+
         # Use the library's method to get the document
         document = client._get_document_for_url(diary_url)
-        
+
         # Extract authenticity token (same way the library does)
         authenticity_token = document.xpath(
             "(//input[@name='authenticity_token']/@value)[1]"
@@ -728,7 +639,7 @@ def add_food_to_diary(
         if not authenticity_token:
             raise RuntimeError("Could not find authenticity token on diary page")
         authenticity_token = authenticity_token[0]
-        
+
         # Map meal names to meal indices (0=Breakfast, 1=Lunch, 2=Dinner, 3=Snacks)
         meal_map = {
             "breakfast": "0",
@@ -738,14 +649,14 @@ def add_food_to_diary(
             "snack": "3",
         }
         meal_index = meal_map.get(meal.lower(), "0")
-        
+
         # Build the URL for adding food
         # MyFitnessPal uses /food/diary/{username}/add endpoint
         add_food_url = parse.urljoin(
             client.BASE_URL_SECURE,
             f"food/diary/{client.effective_username}/add"
         )
-        
+
         # Prepare the data for the POST request
         # Format matches what MyFitnessPal expects based on their form submissions
         post_data = {
@@ -755,32 +666,32 @@ def add_food_to_diary(
             "food_id": mfp_id,
             "quantity": str(quantity),
         }
-        
+
         if unit:
             post_data["unit"] = unit
-        
+
         # Add food to diary
         headers = {
             "Referer": diary_url,
             "Content-Type": "application/x-www-form-urlencoded",
             "X-Requested-With": "XMLHttpRequest",
         }
-        
+
         response = client.session.post(add_food_url, data=post_data, headers=headers)
         response.raise_for_status()
-        
+
         # Check response content for errors
         if response.status_code != 200:
             raise RuntimeError(f"Failed to add food: HTTP {response.status_code}")
-        
+
         # MyFitnessPal might return success even with errors in content
         # Log error indication without exposing full response content (may contain sensitive data)
         content = response.text if hasattr(response, 'text') else response.content.decode('utf-8', errors='ignore')
         if 'error' in content.lower() and 'success' not in content.lower():
             logger.warning("Possible error in response from MyFitnessPal API")
-        
+
         logger.info(f"Successfully added food {mfp_id} to {meal} for {target_date}")
-        
+
     except Exception as e:
         # Don't expose internal error details to avoid leaking sensitive information
         error_msg = str(e)
@@ -794,17 +705,17 @@ def add_food_to_diary(
 def set_water_intake(client, target_date: date, cups: float) -> None:
     """
     Set water intake for a specific date.
-    
+
     Args:
         client: Authenticated myfitnesspal.Client instance
         target_date: Date to set water intake
         cups: Number of cups of water
-    
+
     Raises:
         RuntimeError: If the operation fails
     """
     from urllib import parse
-    
+
     try:
         # Get the diary page for the target date to extract CSRF token
         date_str = target_date.strftime("%Y-%m-%d")
@@ -812,10 +723,10 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
             client.BASE_URL_SECURE,
             f"food/diary/{client.effective_username}?date={date_str}"
         )
-        
+
         # Use the library's method to get the document
         document = client._get_document_for_url(diary_url)
-        
+
         # Extract authenticity token
         authenticity_token = document.xpath(
             "(//input[@name='authenticity_token']/@value)[1]"
@@ -823,36 +734,36 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
         if not authenticity_token:
             raise RuntimeError("Could not find authenticity token on diary page")
         authenticity_token = authenticity_token[0]
-        
+
         # Build the URL for setting water
         # MyFitnessPal uses /food/diary/{username}/water endpoint
         water_url = parse.urljoin(
             client.BASE_URL_SECURE,
             f"food/diary/{client.effective_username}/water"
         )
-        
+
         # Prepare the data for the POST request
         post_data = {
             "authenticity_token": authenticity_token,
             "date": date_str,
             "water": str(cups),
         }
-        
+
         # Set water intake
         headers = {
             "Referer": diary_url,
             "Content-Type": "application/x-www-form-urlencoded",
             "X-Requested-With": "XMLHttpRequest",
         }
-        
+
         response = client.session.post(water_url, data=post_data, headers=headers)
         response.raise_for_status()
-        
+
         if response.status_code != 200:
             raise RuntimeError(f"Failed to set water: HTTP {response.status_code}")
-        
+
         logger.info(f"Successfully set water intake to {cups} cups for {target_date}")
-        
+
     except Exception as e:
         # Don't expose internal error details to avoid leaking sensitive information
         error_msg = str(e)
@@ -1393,12 +1304,12 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
-        
+
         # Normalize meal name (capitalize first letter)
         meal = params.meal.strip().capitalize()
         if meal.lower() == "snack":
             meal = "Snacks"
-        
+
         # Add food to diary
         add_food_to_diary(
             client=client,
@@ -1408,14 +1319,14 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             quantity=params.quantity,
             unit=params.unit,
         )
-        
+
         # Get food details for confirmation
         try:
             food_item = client.get_food_item_details(params.mfp_id)
             food_name = getattr(food_item, "description", "Unknown Food")
-        except:
+        except Exception:
             food_name = "Food item"
-        
+
         return json.dumps(
             {
                 "success": True,
@@ -1429,7 +1340,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             },
             indent=2,
         )
-        
+
     except Exception as e:
         return f"Error adding food to diary: {str(e)}"
 
@@ -1462,10 +1373,10 @@ async def mfp_set_water(params: SetWaterInput) -> str:
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
-        
+
         # Set water intake
         set_water_intake(client=client, target_date=target_date, cups=params.cups)
-        
+
         return json.dumps(
             {
                 "success": True,
@@ -1476,7 +1387,7 @@ async def mfp_set_water(params: SetWaterInput) -> str:
             },
             indent=2,
         )
-        
+
     except Exception as e:
         return f"Error setting water intake: {str(e)}"
 
@@ -1554,95 +1465,30 @@ async def mfp_get_report(params: GetReportInput) -> str:
 
 
 # ============================================================================
-# Cookie Management Tool
-# ============================================================================
-
-
-@mcp.tool()
-def refresh_browser_cookies(browser: str = "chrome") -> str:
-    """
-    Extract and save session cookies from your web browser.
-    
-    Use this tool when authentication fails and you need to refresh your
-    MyFitnessPal session. You must be logged into myfitnesspal.com in your
-    browser for this to work.
-    
-    Args:
-        browser: Which browser to extract cookies from ("chrome" or "firefox")
-    
-    Returns:
-        Success message or error description
-    """
-    import browser_cookie3
-    
-    try:
-        # Get browser cookie function
-        if browser.lower() == "chrome":
-            cj = browser_cookie3.chrome(domain_name='.myfitnesspal.com')
-        elif browser.lower() == "firefox":
-            cj = browser_cookie3.firefox(domain_name='.myfitnesspal.com')
-        else:
-            return f"Unsupported browser: {browser}. Use 'chrome' or 'firefox'."
-        
-        # Extract cookies to dictionary
-        cookies = {c.name: c.value for c in cj}
-        
-        # Check for session token
-        if '__Secure-next-auth.session-token' not in cookies:
-            return (
-                f"No session token found in {browser}. "
-                "Please make sure you are logged into myfitnesspal.com in your browser, "
-                "then try again."
-            )
-        
-        # Save cookies
-        save_cookies(cookies)
-        
-        # Verify they work
-        try:
-            import myfitnesspal
-            cookiejar = dict_to_cookiejar(cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            _ = client.get_date(date.today())
-            
-            return (
-                f"Successfully extracted and verified {len(cookies)} cookies from {browser}. "
-                "Authentication is now working!"
-            )
-        except Exception as e:
-            return (
-                f"Cookies were extracted from {browser} but verification failed: {e}. "
-                "The session may have expired - try logging into myfitnesspal.com again."
-            )
-            
-    except Exception as e:
-        error_msg = str(e)
-        if "Operation not permitted" in error_msg:
-            return (
-                f"Permission denied reading {browser} cookies. "
-                "This can happen due to macOS security restrictions. "
-                "Try running this command in Terminal instead:\n\n"
-                f"{COOKIES_FILE.parent}/../venv/bin/python -c \""
-                "import browser_cookie3, json, os; "
-                "from datetime import datetime; "
-                f"cj = browser_cookie3.{browser}(domain_name='.myfitnesspal.com'); "
-                "cookies = {c.name: c.value for c in cj}; "
-                "os.makedirs(os.path.expanduser('~/.mfp_mcp'), exist_ok=True); "
-                "open(os.path.expanduser('~/.mfp_mcp/cookies.json'), 'w').write("
-                "json.dumps({'cookies': cookies, 'saved_at': datetime.now().isoformat()}, indent=2)); "
-                "print('Cookies refreshed!')\""
-            )
-        return f"Error extracting cookies from {browser}: {e}"
-
-
-# ============================================================================
 # Main Entry Point
 # ============================================================================
 
 
 def main():
-    """Run the MCP server."""
-    mcp.run()
+    """Run the MCP server.
+
+    Supports two transport modes controlled by MCP_TRANSPORT environment variable:
+    - "stdio" (default): Standard input/output for local MCP clients
+    - "streamable-http": HTTP server for remote/Docker deployments
+
+    For HTTP mode, also supports:
+    - MCP_HOST: Host to bind to (default: "127.0.0.1" for stdio, "0.0.0.0" for http)
+    - MCP_PORT: Port to listen on (default: 8000)
+    - MCP_ALLOWED_HOSTS: Comma-separated list of allowed Host headers for reverse proxy
+      (e.g., "mfp.example.com,mfp.example.com:443")
+      If not set, DNS rebinding protection is disabled for HTTP mode.
+    """
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+
+    if transport == "streamable-http":
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":
