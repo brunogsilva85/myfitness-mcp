@@ -75,20 +75,39 @@ def _get_transport_security() -> TransportSecuritySettings | None:
 # token. Gated behind MCP_OAUTH_PASSCODE/MCP_RESOURCE_URL so local stdio use
 # and simple Docker testing don't need to set any of this up.
 def _build_oauth() -> tuple[SinglePasscodeOAuthProvider | None, AuthSettings | None]:
-    """Build the OAuth provider/settings pair, or (None, None) if unconfigured."""
+    """Build the OAuth provider/settings pair, or (None, None) if unconfigured.
+
+    Raises RuntimeError if exactly one of MCP_OAUTH_PASSCODE/MCP_RESOURCE_URL
+    is set. That combination is almost always a misconfiguration (e.g. a
+    passcode that resolved empty due to a missing .env line or shell/compose
+    variable-expansion mangling it), not an intentional choice - silently
+    falling back to no-auth in that case would serve every tool unauthenticated
+    on the public internet with nothing louder than a warning log line.
+    """
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     if transport != "streamable-http":
         return None, None
 
     passcode = os.getenv("MCP_OAUTH_PASSCODE")
     resource_url = os.getenv("MCP_RESOURCE_URL")
-    if not passcode or not resource_url:
+
+    if not passcode and not resource_url:
         logging.getLogger(__name__).warning(
-            "MCP_TRANSPORT=streamable-http but MCP_OAUTH_PASSCODE/MCP_RESOURCE_URL "
-            "are not both set - running WITHOUT OAuth. Do not expose this "
-            "deployment to the internet until both are configured."
+            "MCP_TRANSPORT=streamable-http with no MCP_OAUTH_PASSCODE/"
+            "MCP_RESOURCE_URL set - running WITHOUT OAuth. Do not expose "
+            "this deployment to the internet without configuring both."
         )
         return None, None
+
+    if not passcode or not resource_url:
+        missing = "MCP_OAUTH_PASSCODE" if not passcode else "MCP_RESOURCE_URL"
+        raise RuntimeError(
+            f"{missing} is unset but the other OAuth variable is set - this "
+            "looks like a misconfiguration, not an intentional no-auth "
+            "deployment. Refusing to start rather than silently serving the "
+            "MCP endpoint without authentication. Set both "
+            "MCP_OAUTH_PASSCODE and MCP_RESOURCE_URL, or neither."
+        )
 
     provider = SinglePasscodeOAuthProvider(passcode)
     auth_settings = AuthSettings(
