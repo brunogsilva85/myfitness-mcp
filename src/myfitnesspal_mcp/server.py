@@ -24,7 +24,7 @@ from collections import OrderedDict
 from datetime import date, datetime, timedelta
 from enum import Enum
 from http.cookiejar import CookieJar
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
@@ -198,6 +198,38 @@ _cached_client: Any = None
 _cached_jar: Optional[CookieJar] = None
 
 
+def create_mfp_client(cookiejar: Optional[CookieJar] = None):
+    """
+    Create a MyFitnessPal client using a plain requests-backed session.
+
+    python-myfitnesspal builds its session with ``cloudscraper.create_scraper``.
+    On some hosts that path gets a 403 from ``/user/auth_token`` (called during
+    ``Client.__init__``) even when the exact same authenticated cookies work
+    fine with a plain ``requests`` session. We temporarily monkeypatch
+    ``myfitnesspal.client.cloudscraper.create_scraper`` to hand back the plain
+    ``requests.Session`` the library already passes in as ``sess``, then restore
+    it immediately. Everything else about the client (cookie handling, headers,
+    ``session.get``/``session.post``) is unchanged, so this is a minimal and
+    reversible swap.
+
+    Ported from AdamWalt/myfitnesspal-mcp-python#1.
+    """
+    import requests
+    import myfitnesspal
+    import myfitnesspal.client as myfitnesspal_client
+
+    original_create_scraper = myfitnesspal_client.cloudscraper.create_scraper
+    myfitnesspal_client.cloudscraper.create_scraper = (
+        lambda sess=None, *args, **kwargs: (sess or requests.Session())
+    )
+    try:
+        if cookiejar is None:
+            return myfitnesspal.Client()
+        return myfitnesspal.Client(cookiejar=cookiejar)
+    finally:
+        myfitnesspal_client.cloudscraper.create_scraper = original_create_scraper
+
+
 def get_mfp_client():
     """
     Get an authenticated MyFitnessPal client.
@@ -213,8 +245,6 @@ def get_mfp_client():
     Raises:
         RuntimeError: If no cookie source is configured or readable
     """
-    import myfitnesspal
-
     global _cached_client, _cached_jar
 
     jar = cookie_loader.get_cookiejar()
@@ -222,7 +252,7 @@ def get_mfp_client():
         if _cached_client is not None and _cached_jar is jar:
             return _cached_client
         logger.info("Building MyFitnessPal client from cookie jar (%d cookies)", len(jar))
-        client = myfitnesspal.Client(cookiejar=jar)
+        client = create_mfp_client(cookiejar=jar)
         _cached_client = client
         _cached_jar = jar
         return client
@@ -268,23 +298,28 @@ def format_nutrition_dict(nutrition: Dict[str, Any]) -> Dict[str, Any]:
     return formatted
 
 
-def format_meal_entry(entry) -> Dict[str, Any]:
+def format_meal_entry(entry, entry_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Format a meal entry for output.
 
     Args:
         entry: MFP Entry object
+        entry_id: Optional stable diary-entry ID (surfaced so callers can
+            target the entry with mfp_update_food_entry / mfp_delete_food_entry)
 
     Returns:
         dict: Formatted entry data
     """
-    return {
+    data = {
         "name": entry.name,
         "short_name": getattr(entry, "short_name", None),
         "quantity": getattr(entry, "quantity", None),
         "unit": getattr(entry, "unit", None),
         "nutrition": format_nutrition_dict(entry.totals),
     }
+    if entry_id:
+        data["entry_id"] = entry_id
+    return data
 
 
 def format_exercise(exercise) -> Dict[str, Any]:
@@ -418,6 +453,23 @@ class GetFoodDetailsInput(BaseModel):
         ...,
         description="MyFitnessPal food item ID (obtained from search results)",
         min_length=1,
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' for human-readable or 'json' for structured data",
+    )
+
+
+class GetFoodCollectionInput(BaseModel):
+    """Input model for fetching recent, frequent, or saved foods."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    limit: Optional[int] = Field(
+        default=None,
+        description="Maximum number of foods to return",
+        ge=1,
+        le=100,
     )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
@@ -595,6 +647,59 @@ class AddFoodToDiaryInput(BaseModel):
         ),
         gt=0,
         le=10000,
+    )
+
+
+class UpdateFoodEntryInput(BaseModel):
+    """Input model for updating an existing diary entry."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    entry_id: str = Field(
+        ...,
+        description="Diary entry ID from mfp_get_diary",
+        min_length=1,
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description="Diary date in YYYY-MM-DD format. Required for historical entries; defaults to today.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    meal: Optional[str] = Field(
+        default=None,
+        description="New meal name (e.g., 'Breakfast', 'Lunch', 'Dinner', 'Snacks').",
+    )
+    quantity: Optional[float] = Field(
+        default=None,
+        description="New quantity/servings.",
+        gt=0,
+        le=100,
+    )
+    unit: Optional[str] = Field(
+        default=None,
+        description="New serving size label exactly as shown by MyFitnessPal (for example '350 ml').",
+    )
+    weight_id: Optional[str] = Field(
+        default=None,
+        description="Raw MyFitnessPal serving-size option ID. Overrides `unit` when both are provided.",
+        min_length=1,
+    )
+
+
+class DeleteFoodEntryInput(BaseModel):
+    """Input model for deleting an existing diary entry."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    entry_id: str = Field(
+        ...,
+        description="Diary entry ID from mfp_get_diary",
+        min_length=1,
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description="Diary date in YYYY-MM-DD format. Required for historical entries; defaults to today.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
     )
 
 
@@ -870,6 +975,435 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
 
 
 # ============================================================================
+# Food Collection & Diary Entry Edit Helper Functions
+# ============================================================================
+#
+# Ported from AdamWalt/myfitnesspal-mcp-python#1. These back the recent/
+# frequent/my-foods reads (via the legacy add-to-diary AJAX endpoints) and the
+# update/delete diary-entry writes. python-myfitnesspal parses entry nutrition
+# but discards the stable diary-entry IDs needed for edit/delete, so we scrape
+# them off the diary page ourselves.
+
+
+def get_diary_page_url(client, target_date: date) -> str:
+    """Build the MyFitnessPal diary URL for a specific user and date."""
+    from urllib import parse
+
+    date_str = target_date.strftime("%Y-%m-%d")
+    return parse.urljoin(
+        client.BASE_URL_SECURE,
+        f"food/diary/{client.effective_username}?date={date_str}",
+    )
+
+
+def get_diary_document(client, target_date: date):
+    """Fetch the diary page document for a specific date."""
+    return client._get_document_for_url(get_diary_page_url(client, target_date))
+
+
+def extract_authenticity_token(document) -> str:
+    """Extract the Rails authenticity token from a diary or edit form."""
+    authenticity_token = document.xpath("(//input[@name='authenticity_token']/@value)[1]")
+    if not authenticity_token:
+        raise RuntimeError("Could not find authenticity token on the page")
+    return authenticity_token[0]
+
+
+def extract_csrf_param_and_token(document) -> Tuple[str, str]:
+    """Extract the Rails CSRF param/token pair from page metadata or forms."""
+    csrf_param = document.xpath("string(//meta[@name='csrf-param']/@content)") or "authenticity_token"
+    csrf_token = document.xpath("string(//meta[@name='csrf-token']/@content)")
+    if not csrf_token:
+        csrf_token = extract_authenticity_token(document)
+    return csrf_param, csrf_token
+
+
+def normalize_meal_name(meal: str) -> str:
+    """Normalize a meal name for comparisons and routing."""
+    normalized = meal.strip().lower()
+    if normalized == "snack":
+        return "snacks"
+    return normalized
+
+
+def meal_name_to_id(meal: str) -> str:
+    """Map user-facing meal names to MyFitnessPal's meal IDs."""
+    meal_map = {
+        "breakfast": "0",
+        "lunch": "1",
+        "dinner": "2",
+        "snacks": "3",
+        "snack": "3",
+    }
+    return meal_map.get(normalize_meal_name(meal), "0")
+
+
+def meal_id_to_name(meal_id: Optional[Any]) -> Optional[str]:
+    """Map MyFitnessPal meal IDs back to display names."""
+    if meal_id is None:
+        return None
+
+    meal_map = {
+        0: "Breakfast",
+        1: "Lunch",
+        2: "Dinner",
+        3: "Snacks",
+        "0": "Breakfast",
+        "1": "Lunch",
+        "2": "Dinner",
+        "3": "Snacks",
+    }
+    return meal_map.get(meal_id, str(meal_id))
+
+
+def get_diary_add_page_url(
+    client,
+    meal: str = "Breakfast",
+    target_date: Optional[date] = None,
+) -> str:
+    """
+    Build the legacy add-to-diary page URL.
+
+    The modern `/food/mine`, `/meal/mine`, and `/food/new` pages can redirect to
+    `/account/logout` even when the account is otherwise authenticated. The
+    legacy diary-add page still exposes stable AJAX endpoints for recent,
+    frequent, and saved foods.
+    """
+    from urllib import parse
+
+    target_date = target_date or date.today()
+    return parse.urljoin(
+        client.BASE_URL_SECURE,
+        f"user/{client.effective_username}/diary/add?meal={meal_name_to_id(meal)}&date={target_date:%Y-%m-%d}",
+    )
+
+
+def get_diary_add_tab_headers(
+    client,
+    meal: str = "Breakfast",
+    target_date: Optional[date] = None,
+) -> Dict[str, str]:
+    """Build the AJAX headers required by the legacy add-page tab endpoints."""
+    add_page_url = get_diary_add_page_url(client, meal=meal, target_date=target_date)
+    document = client._get_document_for_url(add_page_url)
+    _, csrf_token = extract_csrf_param_and_token(document)
+    return {
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": add_page_url,
+        "Origin": client.BASE_URL_SECURE.rstrip("/"),
+        "X-CSRF-Token": csrf_token,
+    }
+
+
+def normalize_food_collection_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a legacy add-page item into a stable MCP response shape."""
+    food = item.get("food", {})
+    weight = item.get("weight") or {}
+    brand_name = food.get("brand_name")
+    description = food.get("description")
+    if brand_name and brand_name != "Generic":
+        name = f"{brand_name} - {description}"
+    else:
+        name = description or brand_name or "Unknown Food"
+
+    nutritional_contents = food.get("nutritional_contents") or {}
+    energy = nutritional_contents.get("energy") or {}
+
+    return {
+        "name": name,
+        "description": description,
+        "brand_name": brand_name,
+        "date": item.get("date"),
+        "meal": meal_id_to_name(item.get("meal_id")),
+        "meal_id": item.get("meal_id"),
+        "quantity": item.get("quantity"),
+        "unit": weight.get("unit"),
+        "serving_value": weight.get("value"),
+        "nutrition_multiplier": weight.get("nutrition_multiplier"),
+        "calories": energy.get("value"),
+        "food_id": food.get("id"),
+        "food_version": food.get("version"),
+        "public": food.get("public"),
+        "confirmations": food.get("confirmations"),
+        "item_type": item.get("type"),
+    }
+
+
+def fetch_legacy_food_collection(
+    client,
+    category: str,
+    limit: int,
+    meal: str = "Breakfast",
+    target_date: Optional[date] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch recent, frequent, or saved foods via the legacy add-page AJAX endpoints."""
+    from urllib import parse
+
+    category_map = {
+        "recent": "recent",
+        "frequent": "most_used",
+        "my_foods": "my_foods",
+    }
+    if category not in category_map:
+        raise RuntimeError(f"Unsupported legacy food collection '{category}'")
+
+    headers = get_diary_add_tab_headers(client, meal=meal, target_date=target_date)
+    endpoint = parse.urljoin(client.BASE_URL_SECURE, f"food/load_{category_map[category]}")
+
+    items: List[Dict[str, Any]] = []
+    base_index = 0
+    page = 1
+    while len(items) < limit:
+        response = client.session.post(
+            endpoint,
+            data={"meal": meal_name_to_id(meal), "base_index": base_index, "page": page},
+            headers=headers,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        batch = payload.get("items", [])
+        if not batch:
+            break
+
+        items.extend(normalize_food_collection_item(item) for item in batch)
+        base_index += len(batch)
+        page += 1
+
+    return items[:limit]
+
+
+def extract_diary_entry_ids(client, target_date: date) -> Dict[str, List[Optional[str]]]:
+    """
+    Extract entry IDs from the diary page, grouped by meal.
+
+    The upstream python-myfitnesspal library parses entry nutrition but discards
+    the stable diary-entry IDs needed for edit/delete operations.
+    """
+    document = get_diary_document(client, target_date)
+    entry_ids_by_meal: Dict[str, List[Optional[str]]] = {}
+
+    for meal_header in document.xpath("//tr[@class='meal_header']"):
+        meal_name = "".join(meal_header.xpath("./td[1]//text()")).strip().lower()
+        ids: List[Optional[str]] = []
+        row = meal_header
+        while True:
+            row = row.getnext()
+            if row is None or row.attrib.get("class") is not None:
+                break
+
+            entry_link = row.xpath(".//a[@data-food-entry-id][1]")
+            if entry_link:
+                ids.append(entry_link[0].attrib.get("data-food-entry-id"))
+                continue
+
+            delete_link = row.xpath(".//td[contains(@class, 'delete')]//a/@href")
+            if delete_link:
+                ids.append(delete_link[0].split("/")[-1].split("?")[0])
+            else:
+                ids.append(None)
+
+        entry_ids_by_meal[meal_name] = ids
+
+    return entry_ids_by_meal
+
+
+def get_diary_entry_snapshots(client, target_date: date) -> Dict[str, Dict[str, Any]]:
+    """Return diary entries keyed by stable entry ID for a given date."""
+    day = client.get_date(target_date)
+    entry_ids_by_meal = extract_diary_entry_ids(client, target_date)
+    snapshots: Dict[str, Dict[str, Any]] = {}
+
+    for meal in day.meals:
+        meal_entry_ids = entry_ids_by_meal.get(meal.name.lower(), [])
+        for idx, entry in enumerate(meal.entries):
+            entry_id = meal_entry_ids[idx] if idx < len(meal_entry_ids) else None
+            if not entry_id:
+                continue
+            snapshot = format_meal_entry(entry, entry_id=entry_id)
+            snapshot["meal"] = meal.name
+            snapshots[entry_id] = snapshot
+
+    return snapshots
+
+
+def get_edit_entry_form(client, entry_id: str):
+    """Fetch the edit form for a specific diary entry."""
+    from urllib import parse
+    import lxml.html
+
+    edit_url = parse.urljoin(client.BASE_URL_SECURE, f"food/edit_entry/{entry_id}")
+    response = client.session.get(edit_url)
+    response.raise_for_status()
+    document = lxml.html.document_fromstring(response.text)
+    forms = document.xpath("//form[@id='edit_entry_form']")
+    if not forms:
+        raise RuntimeError(f"Could not load edit form for entry {entry_id}")
+    return edit_url, forms[0]
+
+
+def resolve_weight_id(form, weight_id: Optional[str], unit: Optional[str]) -> str:
+    """Resolve the serving-size option to submit back to MyFitnessPal."""
+    selected = form.xpath(".//select[@name='food_entry[weight_id]']/option[@selected='selected']/@value")
+    if weight_id:
+        return weight_id
+    if unit:
+        wanted = " ".join(unit.split()).lower()
+        for option in form.xpath(".//select[@name='food_entry[weight_id]']/option"):
+            label = " ".join("".join(option.itertext()).split()).lower()
+            if label == wanted:
+                return option.attrib["value"]
+        raise RuntimeError(f"Serving size '{unit}' was not available for this entry")
+    if selected:
+        return selected[0]
+    first_option = form.xpath(".//select[@name='food_entry[weight_id]']/option[1]/@value")
+    if not first_option:
+        raise RuntimeError("Could not determine a serving size for this entry")
+    return first_option[0]
+
+
+def find_replacement_entry(
+    before_entries: Dict[str, Dict[str, Any]],
+    after_entries: Dict[str, Dict[str, Any]],
+    original_entry: Dict[str, Any],
+    requested_meal: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Find the most likely replacement entry when MyFitnessPal rewrites the entry ID."""
+    new_entries = [
+        entry for entry_id, entry in after_entries.items() if entry_id not in before_entries
+    ]
+    if not new_entries:
+        return None
+
+    target_meal = normalize_meal_name(requested_meal or original_entry["meal"])
+    meal_matches = [
+        entry for entry in new_entries if normalize_meal_name(entry["meal"]) == target_meal
+    ]
+    if len(meal_matches) == 1:
+        return meal_matches[0]
+
+    original_short_name = original_entry.get("short_name")
+    if original_short_name:
+        short_name_matches = [
+            entry
+            for entry in meal_matches or new_entries
+            if entry.get("short_name") == original_short_name
+        ]
+        if len(short_name_matches) == 1:
+            return short_name_matches[0]
+
+    original_name = original_entry["name"]
+    name_matches = [
+        entry
+        for entry in meal_matches or new_entries
+        if original_name in entry["name"] or entry["name"] in original_name
+    ]
+    if len(name_matches) == 1:
+        return name_matches[0]
+
+    if len(new_entries) == 1:
+        return new_entries[0]
+
+    return None
+
+
+def update_food_entry(
+    client,
+    entry_id: str,
+    target_date: date,
+    meal: Optional[str] = None,
+    quantity: Optional[float] = None,
+    unit: Optional[str] = None,
+    weight_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Update an existing diary entry and return the confirmed resulting entry."""
+    from urllib import parse
+
+    before_entries = get_diary_entry_snapshots(client, target_date)
+    original_entry = before_entries.get(entry_id)
+    if not original_entry:
+        raise RuntimeError(f"Diary entry {entry_id} was not found on {target_date}")
+
+    edit_url, form = get_edit_entry_form(client, entry_id)
+
+    def val(xpath: str, default: str = "") -> str:
+        result = form.xpath(xpath)
+        return result[0] if result else default
+
+    payload = {
+        "authenticity_token": val(".//input[@name='authenticity_token']/@value"),
+        "food_entry[id]": val(".//input[@name='food_entry[id]']/@value"),
+        "food_entry[date]": target_date.strftime("%Y-%m-%d"),
+        "food_entry[quantity]": str(quantity if quantity is not None else val(".//input[@name='food_entry[quantity]']/@value")),
+        "food_entry[weight_id]": resolve_weight_id(form, weight_id=weight_id, unit=unit),
+        "food_entry[meal_id]": meal_name_to_id(meal) if meal else val(".//select[@name='food_entry[meal_id]']/option[@selected='selected']/@value"),
+    }
+
+    action = parse.urljoin(client.BASE_URL_SECURE, form.attrib["action"])
+    response = client.session.post(
+        action,
+        data=payload,
+        headers={"Referer": edit_url, "Content-Type": "application/x-www-form-urlencoded"},
+        allow_redirects=False,
+    )
+    response.raise_for_status()
+    if response.status_code not in (200, 204, 302, 303):
+        raise RuntimeError(f"Failed to update food entry: HTTP {response.status_code}")
+
+    after_entries = get_diary_entry_snapshots(client, target_date)
+    current_entry = after_entries.get(entry_id)
+    if current_entry is None:
+        current_entry = find_replacement_entry(before_entries, after_entries, original_entry, meal)
+    if current_entry is None:
+        raise RuntimeError(f"Updated entry {entry_id} could not be confirmed on {target_date}")
+
+    logger.info(
+        "Successfully updated food entry %s for %s (current entry id: %s)",
+        entry_id,
+        target_date,
+        current_entry["entry_id"],
+    )
+    return {
+        "before": original_entry,
+        "after": current_entry,
+        "entry_id_changed": current_entry["entry_id"] != entry_id,
+    }
+
+
+def delete_food_entry(client, entry_id: str, target_date: date) -> Dict[str, Any]:
+    """Delete an existing diary entry and return the deleted entry snapshot."""
+    from urllib import parse
+
+    before_entries = get_diary_entry_snapshots(client, target_date)
+    existing_entry = before_entries.get(entry_id)
+    if not existing_entry:
+        raise RuntimeError(f"Diary entry {entry_id} was not found on {target_date}")
+
+    diary_url = get_diary_page_url(client, target_date)
+    document = get_diary_document(client, target_date)
+    csrf_param, csrf_token = extract_csrf_param_and_token(document)
+    delete_url = parse.urljoin(
+        client.BASE_URL_SECURE,
+        f"food/remove/{entry_id}",
+    )
+
+    response = client.session.post(
+        delete_url,
+        data={"_method": "delete", csrf_param: csrf_token},
+        headers={"Referer": diary_url, "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    response.raise_for_status()
+    if response.status_code not in (200, 204, 302, 303):
+        raise RuntimeError(f"Failed to delete food entry: HTTP {response.status_code}")
+
+    after_entries = get_diary_entry_snapshots(client, target_date)
+    if entry_id in after_entries:
+        raise RuntimeError(f"Diary entry {entry_id} still exists after delete")
+
+    logger.info("Successfully deleted food entry %s for %s", entry_id, target_date)
+    return existing_entry
+
+
+# ============================================================================
 # MCP Tools
 # ============================================================================
 
@@ -904,6 +1438,7 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
+        entry_ids_by_meal = extract_diary_entry_ids(client, target_date)
 
         # Build response data
         data = {
@@ -917,8 +1452,23 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
 
         # Process meals
         for meal in day.meals:
+            meal_entry_ids = entry_ids_by_meal.get(meal.name.lower(), [])
+            if len(meal_entry_ids) != len(meal.entries):
+                logger.warning(
+                    "Diary entry ID count mismatch for %s on %s: ids=%s entries=%s",
+                    meal.name,
+                    target_date,
+                    len(meal_entry_ids),
+                    len(meal.entries),
+                )
             meal_data = {
-                "entries": [format_meal_entry(entry) for entry in meal.entries],
+                "entries": [
+                    format_meal_entry(
+                        entry,
+                        entry_id=meal_entry_ids[idx] if idx < len(meal_entry_ids) else None,
+                    )
+                    for idx, entry in enumerate(meal.entries)
+                ],
                 "totals": format_nutrition_dict(meal.totals),
             }
             data["meals"][meal.name] = meal_data
@@ -1059,6 +1609,124 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
 
     except Exception as e:
         return f"Error getting food details: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_get_recent_foods",
+    annotations={
+        "title": "Get Recent Foods",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_get_recent_foods(params: GetFoodCollectionInput) -> str:
+    """
+    Get recently used foods from MyFitnessPal.
+
+    Uses the legacy diary-add AJAX endpoint that still works when newer
+    account pages like `/food/mine` redirect away from authenticated sessions.
+
+    Args:
+        params: GetFoodCollectionInput containing:
+            - limit (int, optional): Max results (default 10, max 100)
+            - response_format (str): 'markdown' or 'json'
+
+    Returns:
+        str: List of recently used foods
+    """
+    try:
+        client = get_mfp_client()
+        limit = params.limit or 10
+        items = fetch_legacy_food_collection(client, category="recent", limit=limit)
+        data = {
+            "count": len(items),
+            "limit": limit,
+            "items": items,
+        }
+        return format_response(data, params.response_format, "Recent Foods")
+    except Exception as e:
+        return f"Error getting recent foods: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_get_frequent_foods",
+    annotations={
+        "title": "Get Frequent Foods",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_get_frequent_foods(params: GetFoodCollectionInput) -> str:
+    """
+    Get most-used foods from MyFitnessPal.
+
+    This is backed by the legacy `load_most_used` endpoint exposed by the
+    add-to-diary page.
+
+    Args:
+        params: GetFoodCollectionInput containing:
+            - limit (int, optional): Max results (default 10, max 100)
+            - response_format (str): 'markdown' or 'json'
+
+    Returns:
+        str: List of most-used foods
+    """
+    try:
+        client = get_mfp_client()
+        limit = params.limit or 10
+        items = fetch_legacy_food_collection(client, category="frequent", limit=limit)
+        data = {
+            "count": len(items),
+            "limit": limit,
+            "items": items,
+        }
+        return format_response(data, params.response_format, "Frequent Foods")
+    except Exception as e:
+        return f"Error getting frequent foods: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_get_my_foods",
+    annotations={
+        "title": "Get My Foods",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_get_my_foods(params: GetFoodCollectionInput) -> str:
+    """
+    Get foods created or saved by the authenticated user.
+
+    This uses the legacy `load_my_foods` endpoint from the add-to-diary page,
+    which remains accessible even when the modern `My Foods` page redirects
+    away from authenticated sessions.
+
+    Args:
+        params: GetFoodCollectionInput containing:
+            - limit (int, optional): Max results (default 100, max 100)
+            - response_format (str): 'markdown' or 'json'
+
+    Returns:
+        str: List of foods created or saved by the account
+    """
+    try:
+        client = get_mfp_client()
+        limit = params.limit or 100
+        items = fetch_legacy_food_collection(client, category="my_foods", limit=limit)
+        data = {
+            "count": len(items),
+            "limit": limit,
+            "items": items,
+        }
+        return format_response(data, params.response_format, "My Foods")
+    except Exception as e:
+        return f"Error getting my foods: {str(e)}"
 
 
 @mcp.tool(
@@ -1435,6 +2103,119 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
 
     except Exception as e:
         return f"Error adding food to diary: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_update_food_entry",
+    annotations={
+        "title": "Update Diary Entry",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_update_food_entry(params: UpdateFoodEntryInput) -> str:
+    """
+    Update an existing MyFitnessPal diary entry.
+
+    Supports changing the meal, quantity, serving size, and date for an entry
+    previously returned by mfp_get_diary (use response_format='json' to get the
+    entry_id). MyFitnessPal can rewrite an entry during edit and return a
+    replacement row, so the response includes `current_entry_id` and
+    `entry_id_changed` to keep callers tracking the right diary row.
+
+    Args:
+        params: UpdateFoodEntryInput containing:
+            - entry_id (str): Diary entry ID from mfp_get_diary JSON output
+            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
+            - meal (str, optional): New meal name
+            - quantity (float, optional): New number of servings
+            - unit (str, optional): New serving-size label
+            - weight_id (str, optional): Raw MFP serving-size option ID
+
+    Returns:
+        str: Confirmation with the current entry id and whether it changed
+    """
+    try:
+        if params.meal is None and params.quantity is None and params.unit is None and params.weight_id is None:
+            return "Error updating food entry: provide at least one of meal, quantity, unit, or weight_id."
+
+        client = get_mfp_client()
+        target_date = parse_date(params.date)
+        result = update_food_entry(
+            client=client,
+            entry_id=params.entry_id,
+            target_date=target_date,
+            meal=params.meal,
+            quantity=params.quantity,
+            unit=params.unit,
+            weight_id=params.weight_id,
+        )
+
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Successfully updated diary entry {params.entry_id}",
+                "entry_id": params.entry_id,
+                "current_entry_id": result["after"]["entry_id"],
+                "entry_id_changed": result["entry_id_changed"],
+                "date": str(target_date),
+                "meal": result["after"]["meal"],
+                "quantity": result["after"]["quantity"],
+                "unit": result["after"]["unit"],
+                "weight_id": params.weight_id,
+                "confirmed_entry_name": result["after"]["name"],
+                "confirmed_meal": result["after"]["meal"],
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return f"Error updating food entry: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_delete_food_entry",
+    annotations={
+        "title": "Delete Diary Entry",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_delete_food_entry(params: DeleteFoodEntryInput) -> str:
+    """
+    Delete an existing MyFitnessPal diary entry.
+
+    Deletes a diary entry identified by the `entry_id` returned by mfp_get_diary
+    (use response_format='json' to get the entry_id).
+
+    Args:
+        params: DeleteFoodEntryInput containing:
+            - entry_id (str): Diary entry ID from mfp_get_diary JSON output
+            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
+
+    Returns:
+        str: Confirmation message with the deleted entry's name and meal
+    """
+    try:
+        client = get_mfp_client()
+        target_date = parse_date(params.date)
+        deleted_entry = delete_food_entry(client=client, entry_id=params.entry_id, target_date=target_date)
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Successfully deleted diary entry {params.entry_id}",
+                "entry_id": params.entry_id,
+                "date": str(target_date),
+                "deleted_entry_name": deleted_entry["name"],
+                "deleted_meal": deleted_entry["meal"],
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return f"Error deleting food entry: {str(e)}"
 
 
 @mcp.tool(

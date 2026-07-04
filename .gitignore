@@ -210,12 +210,18 @@ __marimo__/
 cookies.json
 .mfp_mcp/
 *.mfp_mcp
+tokens.json
 
 # macOS
 .DS_Store
+.AppleDouble
+.LSOverride
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+
+# Claude Code
+.claude/
