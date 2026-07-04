@@ -100,6 +100,31 @@ For local stdio use (Claude Desktop):
 }
 ```
 
+## Troubleshooting
+
+### Tools don't appear even though the connector shows "Connected"
+
+**Problem**: The connector authorizes and shows as Connected, but its tools never
+surface in a conversation - asking the model to use them, or searching for them,
+turns up nothing. No error is shown.
+
+**Cause**: This is almost always a **client-side tool-budget limit, not a problem
+with this server**. Claude caps how many tools can be active in a single
+conversation across *all* connected servers combined. If another connector exposes
+a very large tool set, it can consume that budget and silently crowd this server's
+tools out of the conversation. (Seen in practice with a connector exposing ~170
+tools starving this server's handful.)
+
+**Confirm / fix**:
+1. In a **fresh conversation**, disable the other large connector(s) and check
+   whether these tools now appear. If they do, it was the budget.
+2. Keep high-tool-count connectors in **separate conversations**, or trim their
+   active tools if the client supports per-tool toggles.
+3. This server always returns its full tool list regardless - you can verify
+   independently with an authenticated `tools/list` call against `/mcp`. If that
+   returns the tools but the client doesn't show them, the gap is on the client
+   side, not here.
+
 ## Attribution
 
 - Tool implementations: [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt/myfitnesspal-mcp-python) (MIT, this repo is a fork - full history preserved)
