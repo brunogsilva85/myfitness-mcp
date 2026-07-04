@@ -11,6 +11,9 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 | `mfp_get_diary` | Read | Food diary (meals, entries, nutrition, totals, goals) for a date |
 | `mfp_search_food` | Read | Search the MyFitnessPal food database |
 | `mfp_get_food_details` | Read | Full nutrition breakdown for a food by MFP ID |
+| `mfp_get_recent_foods` | Read | Recently used foods from the authenticated account |
+| `mfp_get_frequent_foods` | Read | Most-used foods from the authenticated account |
+| `mfp_get_my_foods` | Read | Foods created or saved by the authenticated account |
 | `mfp_get_measurements` | Read | Body measurement history (Weight, Body Fat, ...) |
 | `mfp_set_measurement` | Write | Log a body measurement for today |
 | `mfp_get_exercises` | Read | Logged cardio/strength exercises for a date |
@@ -19,7 +22,20 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 | `mfp_get_water` | Read | Water intake for a date |
 | `mfp_set_water` | Write | Log water intake for a date |
 | `mfp_add_food_to_diary` | Write | Add a food entry to a meal |
+| `mfp_update_food_entry` | Write | Update an existing diary entry by `entry_id` |
+| `mfp_delete_food_entry` | Write | Delete an existing diary entry by `entry_id` |
 | `mfp_get_report` | Read | Nutrition report (e.g. Net Calories) over a date range |
+
+### Food collections (recent / frequent / my foods)
+
+`mfp_get_recent_foods`, `mfp_get_frequent_foods`, and `mfp_get_my_foods` each take an optional `limit` (recent/frequent default 10, my-foods default 100, max 100) and `response_format` (`markdown` or `json`). They intentionally use the **legacy add-to-diary AJAX endpoints** (`/food/load_recent`, `/food/load_most_used`, `/food/load_my_foods`) rather than the newer `/food/mine`, `/meal/mine`, or `/food/new` pages, which can redirect to `/account/logout` even when diary reads and API-token fetches still work.
+
+### Editing diary entries
+
+`mfp_get_diary` with `response_format=json` now surfaces an `entry_id` for each meal entry. Pass that id to:
+
+- `mfp_update_food_entry` - change `meal`, `quantity`, `unit` (serving-size label, e.g. `"350 ml"`), or `weight_id` (raw MFP serving-size option id, overrides `unit`) for an entry; requires `date` for historical entries. MyFitnessPal can rewrite an entry during edit, so the response reports `current_entry_id` and `entry_id_changed` so you can keep tracking the right row.
+- `mfp_delete_food_entry` - delete an entry by `entry_id` (requires `date` for historical entries).
 
 ## Authentication: the cookie strategy
 
