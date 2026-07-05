@@ -2154,6 +2154,171 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         return f"Error adding food to diary: {str(e)}"
 
 
+# Serving-size unit labels MFP can convert to grams, and their grams-per-unit.
+# Used to populate gram_weight/grams so gram-based scaling is correct; other
+# units (Serving, bag, cup, ml, ...) have unknown mass and are left to MFP.
+_GRAM_UNITS = {
+    "g": 1.0, "gram": 1.0, "grams": 1.0, "gm": 1.0,
+    "mg": 0.001, "kg": 1000.0,
+    "oz": 28.3495, "ounce": 28.3495, "ounces": 28.3495,
+    "lb": 453.592, "lbs": 453.592, "pound": 453.592, "pounds": 453.592,
+}
+
+
+def create_food(
+    client,
+    *,
+    description: str,
+    calories: float,
+    fat: float,
+    carbs: float,
+    protein: float,
+    brand: str = "",
+    serving_size: str = "1 Serving",
+    servings_per_container: float = 1.0,
+    share_public: bool = False,
+    saturated_fat: Optional[float] = None,
+    polyunsaturated_fat: Optional[float] = None,
+    monounsaturated_fat: Optional[float] = None,
+    trans_fat: Optional[float] = None,
+    cholesterol: Optional[float] = None,
+    sodium: Optional[float] = None,
+    potassium: Optional[float] = None,
+    fiber: Optional[float] = None,
+    sugar: Optional[float] = None,
+    vitamin_a: Optional[float] = None,
+    vitamin_c: Optional[float] = None,
+    calcium: Optional[float] = None,
+    iron: Optional[float] = None,
+) -> dict:
+    """Create a custom food via MyFitnessPal's v2 API; return the created item.
+
+    Why not myfitnesspal.Client.set_new_food(): MFP replaced the old
+    server-rendered ``/food/submit`` and ``/food/new`` Rails forms with a
+    client-side (Next.js) SPA. Those pages no longer contain the hidden
+    ``<input name="authenticity_token">``, so set_new_food()'s token scrape hits
+    an empty xpath result and raises ``IndexError: list index out of range`` for
+    every call, regardless of the nutrition passed.
+
+    Instead we POST the same JSON payload the SPA builds, to the v2 API,
+    authenticated with the account's bearer token (the same mechanism the
+    library uses for set_new_goal)::
+
+        POST {BASE_API_URL}v2/foods
+        {"item": {user_id, brand_name, description, [public],
+                  nutritional_contents: {energy: {unit, value}, <macros>},
+                  serving_sizes: [{value, unit, nutrition_multiplier}]}}
+
+    The ``accept: application/json`` header is REQUIRED -- without it the API
+    edge returns ``400 Illegal request``. Nutrition values are per one
+    ``serving_size``. ``share_public=True`` submits the food to MyFitnessPal's
+    shared database and is IRREVERSIBLE: public foods cannot be edited or
+    deleted afterwards, so this defaults to a private (deletable) food.
+
+    Returns the created food item dict (its ``id`` is the mfp_id). Raises
+    RuntimeError if the API rejects the request.
+    """
+    import re
+
+    # Per-serving nutrition. MFP stores energy as an object, macros as numbers.
+    nutritional_contents: Dict[str, Any] = {
+        "energy": {"unit": "calories", "value": calories},
+        "fat": fat,
+        "carbohydrates": carbs,
+        "protein": protein,
+    }
+    optional_nutrients = {
+        "saturated_fat": saturated_fat,
+        "polyunsaturated_fat": polyunsaturated_fat,
+        "monounsaturated_fat": monounsaturated_fat,
+        "trans_fat": trans_fat,
+        "cholesterol": cholesterol,
+        "sodium": sodium,
+        "potassium": potassium,
+        "fiber": fiber,
+        "sugar": sugar,
+        "vitamin_a": vitamin_a,
+        "vitamin_c": vitamin_c,
+        "calcium": calcium,
+        "iron": iron,
+    }
+    for key, value in optional_nutrients.items():
+        if value is not None:
+            nutritional_contents[key] = value
+
+    # Parse "125 g" / "1 Serving" / "0.5 cup" into a numeric value + unit label.
+    match = re.match(r"^\s*([0-9]*\.?[0-9]+)?\s*(.*\S)?\s*$", serving_size or "")
+    serving_value = float(match.group(1)) if match and match.group(1) else 1.0
+    serving_unit = (match.group(2) if match and match.group(2) else "Serving") or "Serving"
+
+    # If the serving unit is a known mass unit, record gram weights so MFP's
+    # gram-based scaling is correct; otherwise leave grams unknown (MFP defaults).
+    grams_per_unit = _GRAM_UNITS.get(serving_unit.lower())
+    if grams_per_unit is not None:
+        nutritional_contents["grams"] = serving_value * grams_per_unit
+
+    def _serving(value, unit, multiplier, gram_weight=None):
+        s: Dict[str, Any] = {"value": value, "unit": unit, "nutrition_multiplier": multiplier}
+        if gram_weight is not None:
+            s["gram_weight"] = gram_weight
+        return s
+
+    # Base serving carries the nutrition as entered (multiplier 1.0). Mirror the
+    # SPA: add a normalized single-unit serving, plus a container serving when
+    # servings_per_container is meaningful, so users can also log by unit/container.
+    serving_sizes: List[Dict[str, Any]] = [
+        _serving(serving_value, serving_unit, 1.0,
+                 serving_value * grams_per_unit if grams_per_unit is not None else None)
+    ]
+    if serving_value != 1.0:
+        serving_sizes.append(
+            _serving(1.0, serving_unit, 1.0 / serving_value, grams_per_unit)
+        )
+    if servings_per_container and servings_per_container != 1.0:
+        total = serving_value * servings_per_container
+        serving_sizes.append(
+            _serving(
+                1.0,
+                f"container ({total:g} {serving_unit} ea.)",
+                float(servings_per_container),
+                total * grams_per_unit if grams_per_unit is not None else None,
+            )
+        )
+
+    item: Dict[str, Any] = {
+        "user_id": str(client.user_id),
+        "brand_name": brand.strip(),
+        "description": description.strip(),
+        "nutritional_contents": nutritional_contents,
+        "serving_sizes": serving_sizes,
+    }
+    # Only send public when sharing: omitting it yields a private, deletable
+    # food; sending public=true is irreversible.
+    if share_public:
+        item["public"] = True
+
+    headers = {
+        "authorization": f"Bearer {client.access_token}",
+        "mfp-client-id": "mfp-main-js",
+        "mfp-user-id": str(client.user_id),
+        "content-type": "application/json",
+        "accept": "application/json",  # required; without it the edge returns 400 "Illegal request"
+    }
+    url = f"{client.BASE_API_URL}v2/foods"
+    resp = client.session.post(url, data=json.dumps({"item": item}), headers=headers)
+    if not resp.ok:
+        raise RuntimeError(
+            f"MyFitnessPal API rejected the new food (HTTP {resp.status_code}): "
+            f"{resp.text[:300]}"
+        )
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {}
+    items = payload.get("items") or ([payload["item"]] if payload.get("item") else [])
+    return items[0] if items else {}
+
+
 @mcp.tool(
     name="mfp_create_food",
     annotations={
@@ -2166,18 +2331,21 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
 )
 async def mfp_create_food(params: CreateFoodInput) -> str:
     """
-    Create a new custom food in the MyFitnessPal database.
+    Create a new custom food in the MyFitnessPal database (via the v2 API).
 
-    Use this when a food does not already exist in MyFitnessPal (mfp_search_food
-    returns nothing suitable) and you want it available to log. Nutrition values
-    are entered per single serving as defined by `serving_size`.
+    Use this when a food is not already in MyFitnessPal (mfp_search_food returns
+    nothing suitable) and you want it available to log. All nutrition values are
+    entered PER ONE `serving_size` (e.g. serving_size='125 g' with the numbers
+    for a 125 g portion).
 
-    Note: MyFitnessPal does not make a newly created food searchable
-    immediately - it can take a short while to appear in search results. This
-    tool therefore only creates the food; it does NOT return an mfp_id and does
-    NOT add the food to your diary. To log it, run mfp_search_food afterwards to
-    obtain the mfp_id, then mfp_add_food_to_diary. Calling this tool repeatedly
-    with the same details will create duplicate entries.
+    On success the new food's id is returned as `mfp_id`; pass it to
+    mfp_add_food_to_diary to log the food (it may take a short moment to also
+    surface in mfp_search_food). Calling this repeatedly creates duplicate foods.
+
+    IMPORTANT: share_public=True submits the food to MyFitnessPal's shared public
+    database and is IRREVERSIBLE -- public foods can no longer be edited or
+    deleted. Leave it False (default) to create a private food you can later
+    delete.
 
     Args:
         params: CreateFoodInput containing:
@@ -2187,46 +2355,54 @@ async def mfp_create_food(params: CreateFoodInput) -> str:
             - saturated_fat, polyunsaturated_fat, monounsaturated_fat, trans_fat,
               fiber, sugar, sodium, potassium, cholesterol, vitamin_a, vitamin_c,
               calcium, iron (float, optional): Additional nutrients per serving
-            - serving_size (str): Serving-size label (default '1 Serving')
+            - serving_size (str): Serving-size label, e.g. '1 Serving', '125 g' (default '1 Serving')
             - servings_per_container (float): Servings per container (default 1.0)
-            - share_public (bool): Submit to the public database (default False)
+            - share_public (bool): Submit to the public database; irreversible (default False)
 
     Returns:
-        str: Confirmation message describing the created food
+        str: JSON confirmation including the new food's mfp_id
     """
     try:
         client = get_mfp_client()
 
-        client.set_new_food(
-            brand=params.brand,
+        created = create_food(
+            client=client,
             description=params.description,
+            brand=params.brand,
             calories=params.calories,
             fat=params.fat,
             carbs=params.carbs,
             protein=params.protein,
-            sodium=params.sodium,
-            potassium=params.potassium,
+            serving_size=params.serving_size,
+            servings_per_container=params.servings_per_container,
+            share_public=params.share_public,
             saturated_fat=params.saturated_fat,
             polyunsaturated_fat=params.polyunsaturated_fat,
-            fiber=params.fiber,
             monounsaturated_fat=params.monounsaturated_fat,
-            sugar=params.sugar,
             trans_fat=params.trans_fat,
             cholesterol=params.cholesterol,
+            sodium=params.sodium,
+            potassium=params.potassium,
+            fiber=params.fiber,
+            sugar=params.sugar,
             vitamin_a=params.vitamin_a,
-            calcium=params.calcium,
             vitamin_c=params.vitamin_c,
+            calcium=params.calcium,
             iron=params.iron,
-            serving_size=params.serving_size,
-            servingspercontainer=params.servings_per_container,
-            sharepublic=params.share_public,
         )
 
         food_label = f"{params.brand} {params.description}".strip()
+        note = (
+            "Food created. Use the returned mfp_id with mfp_add_food_to_diary to "
+            "log it (it may take a moment to also appear in mfp_search_food)."
+        )
+        if params.share_public:
+            note += " This food was shared PUBLICLY and can no longer be edited or deleted."
         return json.dumps(
             {
                 "success": True,
                 "message": f"Successfully created custom food '{food_label}'",
+                "mfp_id": created.get("id"),
                 "brand": params.brand,
                 "description": params.description,
                 "serving_size": params.serving_size,
@@ -2235,12 +2411,8 @@ async def mfp_create_food(params: CreateFoodInput) -> str:
                 "fat": params.fat,
                 "carbs": params.carbs,
                 "protein": params.protein,
-                "shared_public": params.share_public,
-                "note": (
-                    "MyFitnessPal may take a short while to make this food "
-                    "searchable. Use mfp_search_food to find its mfp_id before "
-                    "adding it to the diary with mfp_add_food_to_diary."
-                ),
+                "public": params.share_public,
+                "note": note,
             },
             indent=2,
         )

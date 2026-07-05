@@ -40,9 +40,13 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 
 ### Creating a custom food
 
-`mfp_create_food` submits a brand-new food to the MyFitnessPal database when `mfp_search_food` turns up nothing suitable. Required fields are `description` and the per-serving core macros (`calories`, `fat`, `carbs`, `protein`); `brand`, `serving_size`, `servings_per_container`, `share_public`, and the optional micronutrients (fiber, sugar, sodium, cholesterol, vitamins, etc.) round it out. All nutrition values are entered **per single serving** as defined by `serving_size`.
+`mfp_create_food` submits a brand-new food to the MyFitnessPal database when `mfp_search_food` turns up nothing suitable. Required fields are `description` and the per-serving core macros (`calories`, `fat`, `carbs`, `protein`); `brand`, `serving_size`, `servings_per_container`, `share_public`, and the optional micronutrients (fiber, sugar, sodium, cholesterol, vitamins, etc.) round it out. All nutrition values are entered **per single serving** as defined by `serving_size` (e.g. `serving_size="125 g"` with the numbers for a 125 g portion). When the serving unit is a mass unit (`g`, `mg`, `kg`, `oz`, `lb`) the gram weight is recorded so MFP's gram-based scaling stays correct.
 
-MyFitnessPal does not make a newly created food searchable immediately, so this is a **two-step flow**: `mfp_create_food` only creates the food (it returns no `mfp_id` and does not touch your diary). To log it, run `mfp_search_food` afterwards to get the `mfp_id`, then `mfp_add_food_to_diary`. Re-running `mfp_create_food` with the same details creates duplicate entries.
+On success it returns the new food's `mfp_id`; pass that to `mfp_add_food_to_diary` to log it (it may take a short moment to also surface in `mfp_search_food`). Re-running with the same details creates duplicate foods.
+
+**`share_public=True` is irreversible** — it submits the food to MyFitnessPal's shared public database, and public foods can no longer be edited or deleted. Leave it `False` (default) to create a private food you can still delete.
+
+> Implementation note: the [`python-myfitnesspal`](https://github.com/coddingtonbear/python-myfitnesspal) library's `set_new_food()` no longer works — MyFitnessPal replaced the server-rendered `/food/new` Rails form with a client-side SPA that has no `authenticity_token` input, so the library's HTML scrape raises `IndexError: list index out of range`. `mfp_create_food` instead POSTs to the `v2/foods` API with the account's bearer token (the same mechanism the library still uses for goals).
 
 ## Authentication: the cookie strategy
 

@@ -4,7 +4,7 @@ Tool implementations ported from AdamWalt/myfitnesspal-mcp-python (MIT);
 OAuth/transport skeleton mirrors garmin-mcp-service.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 from myfitnesspal_mcp.server import main, mcp
 
