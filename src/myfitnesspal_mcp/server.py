@@ -650,6 +650,55 @@ class AddFoodToDiaryInput(BaseModel):
     )
 
 
+class CreateFoodInput(BaseModel):
+    """Input model for creating a new custom food in the MyFitnessPal database."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    description: str = Field(
+        ...,
+        description="Food name/description (e.g., 'Bluecorn Tortilla Chips').",
+        min_length=1,
+    )
+    brand: str = Field(
+        default="",
+        description="Brand or manufacturer (e.g., 'ICA Selection'). Leave empty for a generic/homemade food.",
+    )
+    # Core macros (per serving). Required by MyFitnessPal.
+    calories: float = Field(..., description="Calories per serving (kcal).", ge=0)
+    fat: float = Field(..., description="Total fat per serving (g).", ge=0)
+    carbs: float = Field(..., description="Total carbohydrates per serving (g).", ge=0)
+    protein: float = Field(..., description="Protein per serving (g).", ge=0)
+    # Optional nutrients (per serving). Omit any that are unknown.
+    saturated_fat: Optional[float] = Field(default=None, description="Saturated fat (g).", ge=0)
+    polyunsaturated_fat: Optional[float] = Field(default=None, description="Polyunsaturated fat (g).", ge=0)
+    monounsaturated_fat: Optional[float] = Field(default=None, description="Monounsaturated fat (g).", ge=0)
+    trans_fat: Optional[float] = Field(default=None, description="Trans fat (g).", ge=0)
+    fiber: Optional[float] = Field(default=None, description="Dietary fiber (g).", ge=0)
+    sugar: Optional[float] = Field(default=None, description="Sugars (g).", ge=0)
+    sodium: Optional[float] = Field(default=None, description="Sodium (mg).", ge=0)
+    potassium: Optional[float] = Field(default=None, description="Potassium (mg).", ge=0)
+    cholesterol: Optional[float] = Field(default=None, description="Cholesterol (mg).", ge=0)
+    vitamin_a: Optional[float] = Field(default=None, description="Vitamin A (% daily value).", ge=0)
+    vitamin_c: Optional[float] = Field(default=None, description="Vitamin C (% daily value).", ge=0)
+    calcium: Optional[float] = Field(default=None, description="Calcium (% daily value).", ge=0)
+    iron: Optional[float] = Field(default=None, description="Iron (% daily value).", ge=0)
+    # Serving definition.
+    serving_size: str = Field(
+        default="1 Serving",
+        description="Serving-size label, e.g. '1 Serving', '30 g', '100 ml'. Nutrition values above are per this serving.",
+    )
+    servings_per_container: float = Field(
+        default=1.0,
+        description="Number of servings per container/package.",
+        gt=0,
+    )
+    share_public: bool = Field(
+        default=False,
+        description="If true, submit the food to the public MyFitnessPal database; otherwise keep it private to your account.",
+    )
+
+
 class UpdateFoodEntryInput(BaseModel):
     """Input model for updating an existing diary entry."""
 
@@ -2103,6 +2152,101 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
 
     except Exception as e:
         return f"Error adding food to diary: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_create_food",
+    annotations={
+        "title": "Create Custom Food",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_create_food(params: CreateFoodInput) -> str:
+    """
+    Create a new custom food in the MyFitnessPal database.
+
+    Use this when a food does not already exist in MyFitnessPal (mfp_search_food
+    returns nothing suitable) and you want it available to log. Nutrition values
+    are entered per single serving as defined by `serving_size`.
+
+    Note: MyFitnessPal does not make a newly created food searchable
+    immediately - it can take a short while to appear in search results. This
+    tool therefore only creates the food; it does NOT return an mfp_id and does
+    NOT add the food to your diary. To log it, run mfp_search_food afterwards to
+    obtain the mfp_id, then mfp_add_food_to_diary. Calling this tool repeatedly
+    with the same details will create duplicate entries.
+
+    Args:
+        params: CreateFoodInput containing:
+            - description (str): Food name (required)
+            - brand (str, optional): Brand/manufacturer
+            - calories, fat, carbs, protein (float): Core macros per serving (required)
+            - saturated_fat, polyunsaturated_fat, monounsaturated_fat, trans_fat,
+              fiber, sugar, sodium, potassium, cholesterol, vitamin_a, vitamin_c,
+              calcium, iron (float, optional): Additional nutrients per serving
+            - serving_size (str): Serving-size label (default '1 Serving')
+            - servings_per_container (float): Servings per container (default 1.0)
+            - share_public (bool): Submit to the public database (default False)
+
+    Returns:
+        str: Confirmation message describing the created food
+    """
+    try:
+        client = get_mfp_client()
+
+        client.set_new_food(
+            brand=params.brand,
+            description=params.description,
+            calories=params.calories,
+            fat=params.fat,
+            carbs=params.carbs,
+            protein=params.protein,
+            sodium=params.sodium,
+            potassium=params.potassium,
+            saturated_fat=params.saturated_fat,
+            polyunsaturated_fat=params.polyunsaturated_fat,
+            fiber=params.fiber,
+            monounsaturated_fat=params.monounsaturated_fat,
+            sugar=params.sugar,
+            trans_fat=params.trans_fat,
+            cholesterol=params.cholesterol,
+            vitamin_a=params.vitamin_a,
+            calcium=params.calcium,
+            vitamin_c=params.vitamin_c,
+            iron=params.iron,
+            serving_size=params.serving_size,
+            servingspercontainer=params.servings_per_container,
+            sharepublic=params.share_public,
+        )
+
+        food_label = f"{params.brand} {params.description}".strip()
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Successfully created custom food '{food_label}'",
+                "brand": params.brand,
+                "description": params.description,
+                "serving_size": params.serving_size,
+                "servings_per_container": params.servings_per_container,
+                "calories": params.calories,
+                "fat": params.fat,
+                "carbs": params.carbs,
+                "protein": params.protein,
+                "shared_public": params.share_public,
+                "note": (
+                    "MyFitnessPal may take a short while to make this food "
+                    "searchable. Use mfp_search_food to find its mfp_id before "
+                    "adding it to the diary with mfp_add_food_to_diary."
+                ),
+            },
+            indent=2,
+        )
+
+    except Exception as e:
+        return f"Error creating custom food: {str(e)}"
 
 
 @mcp.tool(

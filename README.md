@@ -22,6 +22,7 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 | `mfp_get_water` | Read | Water intake for a date |
 | `mfp_set_water` | Write | Log water intake for a date |
 | `mfp_add_food_to_diary` | Write | Add a food entry to a meal |
+| `mfp_create_food` | Write | Create a new custom food in the MyFitnessPal database |
 | `mfp_update_food_entry` | Write | Update an existing diary entry by `entry_id` |
 | `mfp_delete_food_entry` | Write | Delete an existing diary entry by `entry_id` |
 | `mfp_get_report` | Read | Nutrition report (e.g. Net Calories) over a date range |
@@ -36,6 +37,12 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 
 - `mfp_update_food_entry` - change `meal`, `quantity`, `unit` (serving-size label, e.g. `"350 ml"`), or `weight_id` (raw MFP serving-size option id, overrides `unit`) for an entry; requires `date` for historical entries. MyFitnessPal can rewrite an entry during edit, so the response reports `current_entry_id` and `entry_id_changed` so you can keep tracking the right row.
 - `mfp_delete_food_entry` - delete an entry by `entry_id` (requires `date` for historical entries).
+
+### Creating a custom food
+
+`mfp_create_food` submits a brand-new food to the MyFitnessPal database when `mfp_search_food` turns up nothing suitable. Required fields are `description` and the per-serving core macros (`calories`, `fat`, `carbs`, `protein`); `brand`, `serving_size`, `servings_per_container`, `share_public`, and the optional micronutrients (fiber, sugar, sodium, cholesterol, vitamins, etc.) round it out. All nutrition values are entered **per single serving** as defined by `serving_size`.
+
+MyFitnessPal does not make a newly created food searchable immediately, so this is a **two-step flow**: `mfp_create_food` only creates the food (it returns no `mfp_id` and does not touch your diary). To log it, run `mfp_search_food` afterwards to get the `mfp_id`, then `mfp_add_food_to_diary`. Re-running `mfp_create_food` with the same details creates duplicate entries.
 
 ## Authentication: the cookie strategy
 
