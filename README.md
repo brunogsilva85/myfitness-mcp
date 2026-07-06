@@ -69,6 +69,7 @@ Session cookies expire eventually (~30 days); when tools start failing with auth
 | `MCP_ALLOWED_HOSTS` | - | Comma-separated allowed `Host` headers (reverse proxy domains). Enables DNS-rebinding protection; if unset, protection is disabled in HTTP mode |
 | `MCP_OAUTH_PASSCODE` | - | Shared passcode for the OAuth login page (remote connectors). Omit for unauthenticated LAN-only use |
 | `MCP_RESOURCE_URL` | - | Exact public URL clients use (no path), e.g. `https://mfp.example.com`. Required together with the passcode |
+| `MCP_ACCESS_TOKEN_TTL` | `2592000` (30 days) | Access-token lifetime in **seconds**. When the token expires the connector re-authorizes, which means re-entering the passcode; a short value (the old 24h default) forces a daily re-login if the client doesn't silently refresh. Lower it (e.g. `86400`) for tighter tokens |
 
 ## Docker
 

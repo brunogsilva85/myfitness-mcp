@@ -12,6 +12,8 @@ network-level access control (e.g. an IP allowlist in front of this
 deployment) is what actually restricts who can reach /login at all.
 """
 
+import logging
+import os
 import secrets
 import time
 from dataclasses import dataclass
@@ -26,7 +28,42 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-ACCESS_TOKEN_TTL_SECONDS = 24 * 3600
+logger = logging.getLogger(__name__)
+
+_DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+
+
+def _access_token_ttl_seconds() -> int:
+    """Access-token lifetime in seconds, from MCP_ACCESS_TOKEN_TTL (default 30 days).
+
+    The shared passcode is the only interactive login step, so a short-lived
+    access token means re-entering the passcode every time it expires -- when a
+    connector doesn't silently refresh, a 24h token forces a daily re-login.
+    Default to a long lifetime; operators who want tighter tokens can lower it
+    (e.g. MCP_ACCESS_TOKEN_TTL=86400 for 24h).
+    """
+    raw = os.environ.get("MCP_ACCESS_TOKEN_TTL", "").strip()
+    if not raw:
+        return _DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "MCP_ACCESS_TOKEN_TTL=%r is not an integer; using default %ds",
+            raw, _DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
+        )
+        return _DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+    if value <= 0:
+        logger.warning(
+            "MCP_ACCESS_TOKEN_TTL=%r must be a positive number of seconds; using default %ds",
+            raw, _DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
+        )
+        return _DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+    return value
+
+
+# Access token lifetime, resolved once at import from the environment.
+ACCESS_TOKEN_TTL_SECONDS = _access_token_ttl_seconds()
 AUTH_CODE_TTL_SECONDS = 300
 LOGIN_TTL_SECONDS = 600
 
