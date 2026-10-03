@@ -198,6 +198,50 @@ _cached_client: Any = None
 _cached_jar: Optional[CookieJar] = None
 
 
+_HTTP_TIMEOUT = (5, 25)  # (conexao, leitura) em segundos; o MFP as vezes nao responde
+
+
+def _install_http_timeout():
+    """Timeout padrao em todas as chamadas `requests` + log de chamadas lentas/falhas.
+
+    A biblioteca python-myfitnesspal nao define timeout, entao uma chamada sem
+    resposta travava o servidor por minutos. Idempotente.
+    """
+    import time
+
+    import requests
+
+    if getattr(requests.sessions.Session.request, "_mfp_timeout_patch", False):
+        return
+    _orig = requests.sessions.Session.request
+
+    def _request(self, method, url, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = _HTTP_TIMEOUT
+        t0 = time.monotonic()
+        try:
+            resp = _orig(self, method, url, **kwargs)
+        except Exception as exc:
+            logger.warning(
+                "MFPHTTP %s %s FALHOU em %.1fs: %r",
+                method, str(url).split("?")[0], time.monotonic() - t0, exc,
+            )
+            raise
+        dt = time.monotonic() - t0
+        if dt > 5:
+            logger.warning(
+                "MFPHTTP %s %s -> %s em %.1fs",
+                method, str(url).split("?")[0], resp.status_code, dt,
+            )
+        return resp
+
+    _request._mfp_timeout_patch = True
+    requests.sessions.Session.request = _request
+
+
+_install_http_timeout()
+
+
 def create_mfp_client(cookiejar: Optional[CookieJar] = None):
     """
     Create a MyFitnessPal client using a plain requests-backed session.
