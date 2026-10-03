@@ -1205,6 +1205,13 @@ def normalize_food_collection_item(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+import asyncio as _asyncio
+import time as _time
+
+_LEGACY_MAX_PAGES = 2         # cada pagina (25 itens) leva ~45s no MFP
+_LEGACY_PAGE_BUDGET_S = 60.0  # so busca a 2a pagina se a 1a levou menos que isso
+
+
 def fetch_legacy_food_collection(
     client,
     category: str,
@@ -1229,11 +1236,14 @@ def fetch_legacy_food_collection(
     items: List[Dict[str, Any]] = []
     base_index = 0
     page = 1
-    while len(items) < limit:
+    _t0 = _time.monotonic()
+    while (len(items) < limit and page <= _LEGACY_MAX_PAGES
+           and (page == 1 or _time.monotonic() - _t0 < _LEGACY_PAGE_BUDGET_S)):
         response = client.session.post(
             endpoint,
             data={"meal": meal_name_to_id(meal), "base_index": base_index, "page": page},
             headers=headers,
+            timeout=(5, 90),
         )
         response.raise_for_status()
         payload = response.json()
@@ -1735,7 +1745,7 @@ async def mfp_get_recent_foods(params: GetFoodCollectionInput) -> str:
     try:
         client = get_mfp_client()
         limit = params.limit or 10
-        items = fetch_legacy_food_collection(client, category="recent", limit=limit)
+        items = await _asyncio.to_thread(fetch_legacy_food_collection, client, category="recent", limit=limit)
         data = {
             "count": len(items),
             "limit": limit,
@@ -1775,7 +1785,7 @@ async def mfp_get_frequent_foods(params: GetFoodCollectionInput) -> str:
     try:
         client = get_mfp_client()
         limit = params.limit or 10
-        items = fetch_legacy_food_collection(client, category="frequent", limit=limit)
+        items = await _asyncio.to_thread(fetch_legacy_food_collection, client, category="frequent", limit=limit)
         data = {
             "count": len(items),
             "limit": limit,
@@ -1816,7 +1826,7 @@ async def mfp_get_my_foods(params: GetFoodCollectionInput) -> str:
     try:
         client = get_mfp_client()
         limit = params.limit or 100
-        items = fetch_legacy_food_collection(client, category="my_foods", limit=limit)
+        items = await _asyncio.to_thread(fetch_legacy_food_collection, client, category="my_foods", limit=limit)
         data = {
             "count": len(items),
             "limit": limit,
