@@ -775,7 +775,7 @@ class SetWaterInput(BaseModel):
 # ============================================================================
 
 
-def add_food_to_diary(
+def _add_food_to_diary_once(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0,
 ) -> None:
     """
@@ -949,6 +949,33 @@ def add_food_to_diary(
         raise
     except Exception as e:
         raise RuntimeError(f"Failed to add food to diary: {e}")
+
+
+def add_food_to_diary(*args, **kwargs):
+    """Wrapper com retry: alimento recem-criado pode demorar a aparecer na busca do MFP.
+
+    Repete so quando o erro vem da etapa de busca (antes do POST /food/add),
+    entao nao ha risco de duplicar a entrada no diario.
+    """
+    import time as _time
+
+    delays = (2.0, 4.0, 8.0)
+    for attempt in range(len(delays) + 1):
+        try:
+            return _add_food_to_diary_once(*args, **kwargs)
+        except RuntimeError as exc:
+            msg = str(exc)
+            retriable = (
+                "was not in the first page" in msg
+                or "No search results returned" in msg
+            )
+            if not retriable or attempt == len(delays):
+                raise
+            logger.warning(
+                "add_food_to_diary: id nao encontrado na busca (tentativa %d/%d); nova tentativa em %.0fs",
+                attempt + 1, len(delays) + 1, delays[attempt],
+            )
+            _time.sleep(delays[attempt])
 
 
 def set_water_intake(client, target_date: date, cups: float) -> None:
@@ -1536,7 +1563,8 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
         )
 
     except Exception as e:
-        return f"Error retrieving diary: {str(e)}"
+        logger.exception("mfp_get_diary falhou")
+        return f"Error retrieving diary: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -1590,7 +1618,25 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
         )
 
     except Exception as e:
-        return f"Error searching foods: {str(e)}"
+        logger.exception("mfp_search_food falhou")
+        return f"Error searching foods: {type(e).__name__}: {e}"
+
+
+def _safe_attr(obj, name, default=None):
+    """getattr que tambem engole KeyError e outros erros de propriedades da biblioteca."""
+    try:
+        return getattr(obj, name, default)
+    except Exception:
+        return default
+
+
+def _food_display_name(item, default="Unknown Food"):
+    """Nome legivel do alimento: a biblioteca expoe name/brand (nao description)."""
+    name = _safe_attr(item, "name", None) or _safe_attr(item, "description", None)
+    brand = _safe_attr(item, "brand", None) or _safe_attr(item, "brand_name", None)
+    if name and brand and str(brand).lower() not in str(name).lower():
+        return f"{brand} - {name}"
+    return str(name) if name else default
 
 
 @mcp.tool(
@@ -1624,40 +1670,41 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
 
         data = {
             "mfp_id": params.mfp_id,
-            "description": getattr(item, "description", "N/A"),
-            "brand_name": getattr(item, "brand_name", None),
-            "verified": getattr(item, "verified", False),
-            "calories": getattr(item, "calories", None),
+            "description": _food_display_name(item, "N/A"),
+            "brand_name": _safe_attr(item, "brand_name", None) or _safe_attr(item, "brand", None),
+            "verified": _safe_attr(item, "verified", False),
+            "calories": _safe_attr(item, "calories", None),
             "nutrition": {
-                "protein": getattr(item, "protein", None),
-                "carbohydrates": getattr(item, "carbohydrates", None),
-                "fat": getattr(item, "fat", None),
-                "fiber": getattr(item, "fiber", None),
-                "sugar": getattr(item, "sugar", None),
-                "sodium": getattr(item, "sodium", None),
-                "cholesterol": getattr(item, "cholesterol", None),
-                "saturated_fat": getattr(item, "saturated_fat", None),
-                "polyunsaturated_fat": getattr(item, "polyunsaturated_fat", None),
-                "monounsaturated_fat": getattr(item, "monounsaturated_fat", None),
-                "trans_fat": getattr(item, "trans_fat", None),
-                "potassium": getattr(item, "potassium", None),
-                "vitamin_a": getattr(item, "vitamin_a", None),
-                "vitamin_c": getattr(item, "vitamin_c", None),
-                "calcium": getattr(item, "calcium", None),
-                "iron": getattr(item, "iron", None),
+                "protein": _safe_attr(item, "protein", None),
+                "carbohydrates": _safe_attr(item, "carbohydrates", None),
+                "fat": _safe_attr(item, "fat", None),
+                "fiber": _safe_attr(item, "fiber", None),
+                "sugar": _safe_attr(item, "sugar", None),
+                "sodium": _safe_attr(item, "sodium", None),
+                "cholesterol": _safe_attr(item, "cholesterol", None),
+                "saturated_fat": _safe_attr(item, "saturated_fat", None),
+                "polyunsaturated_fat": _safe_attr(item, "polyunsaturated_fat", None),
+                "monounsaturated_fat": _safe_attr(item, "monounsaturated_fat", None),
+                "trans_fat": _safe_attr(item, "trans_fat", None),
+                "potassium": _safe_attr(item, "potassium", None),
+                "vitamin_a": _safe_attr(item, "vitamin_a", None),
+                "vitamin_c": _safe_attr(item, "vitamin_c", None),
+                "calcium": _safe_attr(item, "calcium", None),
+                "iron": _safe_attr(item, "iron", None),
             },
             "servings": [],
         }
 
         # Get serving sizes if available
-        if hasattr(item, "servings"):
-            for serving in item.servings:
+        if _safe_attr(item, "servings", None) is not None:
+            for serving in _safe_attr(item, "servings", None) or []:
                 data["servings"].append(str(serving))
 
         return format_response(data, params.response_format, "Food Item Details")
 
     except Exception as e:
-        return f"Error getting food details: {str(e)}"
+        logger.exception("mfp_get_food_details falhou")
+        return f"Error getting food details: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -1696,7 +1743,8 @@ async def mfp_get_recent_foods(params: GetFoodCollectionInput) -> str:
         }
         return format_response(data, params.response_format, "Recent Foods")
     except Exception as e:
-        return f"Error getting recent foods: {str(e)}"
+        logger.exception("mfp_get_recent_foods falhou")
+        return f"Error getting recent foods: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -1735,7 +1783,8 @@ async def mfp_get_frequent_foods(params: GetFoodCollectionInput) -> str:
         }
         return format_response(data, params.response_format, "Frequent Foods")
     except Exception as e:
-        return f"Error getting frequent foods: {str(e)}"
+        logger.exception("mfp_get_frequent_foods falhou")
+        return f"Error getting frequent foods: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -1775,7 +1824,8 @@ async def mfp_get_my_foods(params: GetFoodCollectionInput) -> str:
         }
         return format_response(data, params.response_format, "My Foods")
     except Exception as e:
-        return f"Error getting my foods: {str(e)}"
+        logger.exception("mfp_get_my_foods falhou")
+        return f"Error getting my foods: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -1841,7 +1891,8 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
         )
 
     except Exception as e:
-        return f"Error getting measurements: {str(e)}"
+        logger.exception("mfp_get_measurements falhou")
+        return f"Error getting measurements: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -1884,7 +1935,8 @@ async def mfp_set_measurement(params: SetMeasurementInput) -> str:
         )
 
     except Exception as e:
-        return f"Error setting measurement: {str(e)}"
+        logger.exception("mfp_set_measurement falhou")
+        return f"Error setting measurement: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -1938,7 +1990,8 @@ async def mfp_get_exercises(params: GetExercisesInput) -> str:
         )
 
     except Exception as e:
-        return f"Error getting exercises: {str(e)}"
+        logger.exception("mfp_get_exercises falhou")
+        return f"Error getting exercises: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -1975,7 +2028,8 @@ async def mfp_get_goals(params: GetGoalsInput) -> str:
         return format_response(data, params.response_format, "Daily Nutrition Goals")
 
     except Exception as e:
-        return f"Error getting goals: {str(e)}"
+        logger.exception("mfp_get_goals falhou")
+        return f"Error getting goals: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -2042,7 +2096,8 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
         )
 
     except Exception as e:
-        return f"Error setting goals: {str(e)}"
+        logger.exception("mfp_set_goals falhou")
+        return f"Error setting goals: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -2082,7 +2137,8 @@ async def mfp_get_water(params: GetWaterInput) -> str:
         return json.dumps(data, indent=2)
 
     except Exception as e:
-        return f"Error getting water intake: {str(e)}"
+        logger.exception("mfp_get_water falhou")
+        return f"Error getting water intake: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -2133,7 +2189,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         # Get food details for confirmation
         try:
             food_item = client.get_food_item_details(params.mfp_id)
-            food_name = getattr(food_item, "description", "Unknown Food")
+            food_name = _food_display_name(food_item)
         except Exception:
             food_name = "Food item"
 
@@ -2151,7 +2207,8 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         )
 
     except Exception as e:
-        return f"Error adding food to diary: {str(e)}"
+        logger.exception("mfp_add_food_to_diary falhou")
+        return f"Error adding food to diary: {type(e).__name__}: {e}"
 
 
 # Serving-size unit labels MFP can convert to grams, and their grams-per-unit.
@@ -2418,7 +2475,8 @@ async def mfp_create_food(params: CreateFoodInput) -> str:
         )
 
     except Exception as e:
-        return f"Error creating custom food: {str(e)}"
+        logger.exception("mfp_create_food falhou")
+        return f"Error creating custom food: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -2487,7 +2545,8 @@ async def mfp_update_food_entry(params: UpdateFoodEntryInput) -> str:
             indent=2,
         )
     except Exception as e:
-        return f"Error updating food entry: {str(e)}"
+        logger.exception("mfp_update_food_entry falhou")
+        return f"Error updating food entry: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -2531,7 +2590,8 @@ async def mfp_delete_food_entry(params: DeleteFoodEntryInput) -> str:
             indent=2,
         )
     except Exception as e:
-        return f"Error deleting food entry: {str(e)}"
+        logger.exception("mfp_delete_food_entry falhou")
+        return f"Error deleting food entry: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -2578,7 +2638,8 @@ async def mfp_set_water(params: SetWaterInput) -> str:
         )
 
     except Exception as e:
-        return f"Error setting water intake: {str(e)}"
+        logger.exception("mfp_set_water falhou")
+        return f"Error setting water intake: {type(e).__name__}: {e}"
 
 
 @mcp.tool(
@@ -2650,7 +2711,8 @@ async def mfp_get_report(params: GetReportInput) -> str:
         )
 
     except Exception as e:
-        return f"Error getting report: {str(e)}"
+        logger.exception("mfp_get_report falhou")
+        return f"Error getting report: {type(e).__name__}: {e}"
 
 
 # ============================================================================
