@@ -62,7 +62,7 @@ Session cookies expire eventually (~30 days); when tools start failing with auth
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MFP_FIREFOX_PROFILE_DIR` | `/profile` (Docker) | Firefox profile dir (or parent dir of profiles) containing `cookies.sqlite` with a logged-in MFP session |
-| `MFP_COOKIES_FILE` | - | JSON cookies file; used if set and no `cookies.sqlite` is found |
+| `MFP_COOKIES_FILE` | - | JSON cookies file; used if set and no `cookies.sqlite` is found Mount the file's **directory** (e.g. `-v ~/.mfp_mcp:/mfp:ro` with `MFP_COOKIES_FILE=/mfp/cookies.json`), not the file itself: a single-file bind mount keeps pointing at the old inode when the file is replaced, so refreshed cookies are only seen after a restart |
 | `MCP_TRANSPORT` | `stdio` (`streamable-http` in Docker) | Transport: `stdio` or `streamable-http` |
 | `MCP_HOST` | `127.0.0.1` (`0.0.0.0` in Docker) | Bind address for HTTP mode |
 | `MCP_PORT` | `8000` | Port for HTTP mode |
@@ -70,6 +70,8 @@ Session cookies expire eventually (~30 days); when tools start failing with auth
 | `MCP_OAUTH_PASSCODE` | - | Shared passcode for the OAuth login page (remote connectors). Omit for unauthenticated LAN-only use |
 | `MCP_RESOURCE_URL` | - | Exact public URL clients use (no path), e.g. `https://mfp.example.com`. Required together with the passcode |
 | `MCP_ACCESS_TOKEN_TTL` | `2592000` (30 days) | Access-token lifetime in **seconds**. When the token expires the connector re-authorizes, which means re-entering the passcode; a short value (the old 24h default) forces a daily re-login if the client doesn't silently refresh. Lower it (e.g. `86400`) for tighter tokens |
+| `MCP_OAUTH_STATE_FILE` | - | Path to a JSON file (on a persistent volume) where registered clients and issued tokens are kept, so a restart doesn't force the passcode login again. Tokens are stored only as HMAC-SHA256 keyed by the passcode (a leaked file can't be replayed) and changing the passcode invalidates them all. Unset = in-memory only (previous behaviour) |
+| `MCP_REFRESH_TOKEN_TTL` | `7776000` (90 days) | Refresh-token lifetime in **seconds**. Renewed on every refresh (tokens rotate), so an active connector never hits it |
 
 ## Docker
 
