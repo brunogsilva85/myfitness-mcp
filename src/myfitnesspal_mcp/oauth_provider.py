@@ -7,14 +7,22 @@ implements just enough of OAuthAuthorizationServerProvider to satisfy that,
 with a single shared passcode standing in for a real login screen since
 there is exactly one operator of this server.
 
-This proves "the caller knows the passcode", not a real user identity -
-network-level access control (e.g. an IP allowlist in front of this
-deployment) is what actually restricts who can reach /login at all.
+Persistence (optional): set MCP_OAUTH_STATE_FILE to keep registered clients
+and issued tokens across restarts, so a container restart doesn't force the
+passcode login again. Tokens are never written in clear: the file only holds
+HMAC-SHA256(passcode, token), so a leaked file can't be replayed, and changing
+the passcode invalidates every stored token. Short-lived state (pending logins,
+authorization codes) stays in memory.
 """
 
+import hashlib
+import hmac
+import json
 import logging
 import os
 import secrets
+import tempfile
+import threading
 import time
 from dataclasses import dataclass
 
@@ -31,39 +39,33 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+_DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 90 * 24 * 3600  # 90 days, renewed on every refresh
+_STATE_VERSION = 1
 
 
-def _access_token_ttl_seconds() -> int:
-    """Access-token lifetime in seconds, from MCP_ACCESS_TOKEN_TTL (default 30 days).
-
-    The shared passcode is the only interactive login step, so a short-lived
-    access token means re-entering the passcode every time it expires -- when a
-    connector doesn't silently refresh, a 24h token forces a daily re-login.
-    Default to a long lifetime; operators who want tighter tokens can lower it
-    (e.g. MCP_ACCESS_TOKEN_TTL=86400 for 24h).
-    """
-    raw = os.environ.get("MCP_ACCESS_TOKEN_TTL", "").strip()
+def _ttl_from_env(name: str, default: int) -> int:
+    """Positive integer seconds from env var `name`, else `default`."""
+    raw = os.environ.get(name, "").strip()
     if not raw:
-        return _DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+        return default
     try:
         value = int(raw)
     except ValueError:
-        logger.warning(
-            "MCP_ACCESS_TOKEN_TTL=%r is not an integer; using default %ds",
-            raw, _DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
-        )
-        return _DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+        logger.warning("%s=%r is not an integer; using default %ds", name, raw, default)
+        return default
     if value <= 0:
-        logger.warning(
-            "MCP_ACCESS_TOKEN_TTL=%r must be a positive number of seconds; using default %ds",
-            raw, _DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
-        )
-        return _DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+        logger.warning("%s=%r must be a positive number of seconds; using default %ds", name, raw, default)
+        return default
     return value
 
 
-# Access token lifetime, resolved once at import from the environment.
+def _access_token_ttl_seconds() -> int:
+    """Access-token lifetime in seconds, from MCP_ACCESS_TOKEN_TTL (default 30 days)."""
+    return _ttl_from_env("MCP_ACCESS_TOKEN_TTL", _DEFAULT_ACCESS_TOKEN_TTL_SECONDS)
+
+
 ACCESS_TOKEN_TTL_SECONDS = _access_token_ttl_seconds()
+REFRESH_TOKEN_TTL_SECONDS = _ttl_from_env("MCP_REFRESH_TOKEN_TTL", _DEFAULT_REFRESH_TOKEN_TTL_SECONDS)
 AUTH_CODE_TTL_SECONDS = 300
 LOGIN_TTL_SECONDS = 600
 
@@ -82,19 +84,122 @@ class _PendingAuthorization:
     created_at: float
 
 
+@dataclass
+class _StoredToken:
+    client_id: str
+    scopes: list[str]
+    expires_at: int | None
+
+
 class SinglePasscodeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
     """OAuth authorization server gated by one shared passcode."""
 
-    def __init__(self, passcode: str):
+    def __init__(self, passcode: str, state_file: str | None = None):
         self._passcode = passcode
+        self._hmac_key = passcode.encode()
+        self._state_file = state_file if state_file is not None else (os.environ.get("MCP_OAUTH_STATE_FILE") or None)
+        self._lock = threading.Lock()
         self._clients: dict[str, OAuthClientInformationFull] = {}
         self._pending: dict[str, _PendingAuthorization] = {}
         self._auth_codes: dict[str, AuthorizationCode] = {}
-        self._access_tokens: dict[str, AccessToken] = {}
-        self._refresh_tokens: dict[str, RefreshToken] = {}
+        # Keyed by HMAC digest of the token, never by the token itself.
+        self._access_tokens: dict[str, _StoredToken] = {}
+        self._refresh_tokens: dict[str, _StoredToken] = {}
+        self._load_state()
 
     def verify_passcode(self, candidate: str) -> bool:
         return secrets.compare_digest(candidate or "", self._passcode)
+
+    # --- Persistence ---
+
+    def _digest(self, token: str) -> str:
+        return hmac.new(self._hmac_key, token.encode(), hashlib.sha256).hexdigest()
+
+    def _key_id(self) -> str:
+        # Detects a passcode change without storing anything that helps guess it.
+        return self._digest("mfp-oauth-state-key-id")
+
+    def _load_state(self) -> None:
+        if not self._state_file:
+            return
+        try:
+            with open(self._state_file, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            logger.info("OAuth state file %s not found; starting empty", self._state_file)
+            return
+        except (OSError, ValueError) as e:
+            logger.warning("Could not read OAuth state file %s (%r); starting empty", self._state_file, e)
+            return
+
+        if data.get("version") != _STATE_VERSION:
+            logger.warning("OAuth state file has unknown version; starting empty")
+            return
+
+        for raw in data.get("clients", []):
+            try:
+                client = OAuthClientInformationFull.model_validate(raw)
+                self._clients[client.client_id] = client
+            except Exception as e:  # noqa: BLE001 - skip one bad record, keep the rest
+                logger.warning("Skipping invalid stored client: %r", e)
+
+        if data.get("key_id") != self._key_id():
+            logger.warning("Passcode changed since OAuth state was saved; dropping stored tokens")
+            self._save_state()
+            return
+
+        now = time.time()
+        for attr in ("access_tokens", "refresh_tokens"):
+            target = getattr(self, "_" + attr)
+            for digest, rec in data.get(attr, {}).items():
+                tok = _StoredToken(rec["client_id"], list(rec["scopes"]), rec.get("expires_at"))
+                if tok.expires_at is not None and tok.expires_at < now:
+                    continue
+                if tok.client_id not in self._clients:
+                    continue
+                target[digest] = tok
+        logger.info(
+            "Loaded OAuth state: %d clients, %d access tokens, %d refresh tokens",
+            len(self._clients), len(self._access_tokens), len(self._refresh_tokens),
+        )
+
+    def _save_state(self) -> None:
+        if not self._state_file:
+            return
+        now = time.time()
+
+        def live(store: dict[str, _StoredToken]) -> dict:
+            return {
+                d: {"client_id": t.client_id, "scopes": t.scopes, "expires_at": t.expires_at}
+                for d, t in store.items()
+                if t.expires_at is None or t.expires_at >= now
+            }
+
+        data = {
+            "version": _STATE_VERSION,
+            "key_id": self._key_id(),
+            "clients": [c.model_dump(mode="json", exclude_none=True) for c in self._clients.values()],
+            "access_tokens": live(self._access_tokens),
+            "refresh_tokens": live(self._refresh_tokens),
+        }
+        directory = os.path.dirname(os.path.abspath(self._state_file))
+        with self._lock:
+            try:
+                fd, tmp = tempfile.mkstemp(prefix=".oauth-state-", dir=directory)
+                try:
+                    os.fchmod(fd, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(data, f)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, self._state_file)
+                except BaseException:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                    raise
+            except OSError as e:
+                # Never break auth because the disk write failed; tokens still work until restart.
+                logger.error("Could not write OAuth state file %s: %r", self._state_file, e)
 
     # --- Dynamic client registration ---
 
@@ -103,6 +208,7 @@ class SinglePasscodeOAuthProvider(OAuthAuthorizationServerProvider[Authorization
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self._clients[client_info.client_id] = client_info
+        self._save_state()
 
     # --- Authorization ("login") ---
 
@@ -169,10 +275,17 @@ class SinglePasscodeOAuthProvider(OAuthAuthorizationServerProvider[Authorization
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        token = self._refresh_tokens.get(refresh_token)
-        if token is None or token.client_id != client.client_id:
+        digest = self._digest(refresh_token)
+        stored = self._refresh_tokens.get(digest)
+        if stored is None or stored.client_id != client.client_id:
             return None
-        return token
+        if stored.expires_at is not None and stored.expires_at < time.time():
+            del self._refresh_tokens[digest]
+            self._save_state()
+            return None
+        return RefreshToken(
+            token=refresh_token, client_id=stored.client_id, scopes=stored.scopes, expires_at=stored.expires_at
+        )
 
     async def exchange_refresh_token(
         self,
@@ -180,32 +293,38 @@ class SinglePasscodeOAuthProvider(OAuthAuthorizationServerProvider[Authorization
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        self._refresh_tokens.pop(refresh_token.token, None)
+        # Rotation: the old refresh token stops working as soon as it's used.
+        self._refresh_tokens.pop(self._digest(refresh_token.token), None)
         return self._issue_token(client.client_id, scopes or refresh_token.scopes or DEFAULT_SCOPES)
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        access = self._access_tokens.get(token)
-        if access is None:
+        digest = self._digest(token)
+        stored = self._access_tokens.get(digest)
+        if stored is None:
             return None
-        if access.expires_at is not None and access.expires_at < time.time():
-            del self._access_tokens[token]
+        if stored.expires_at is not None and stored.expires_at < time.time():
+            del self._access_tokens[digest]
+            self._save_state()
             return None
-        return access
+        return AccessToken(token=token, client_id=stored.client_id, scopes=stored.scopes, expires_at=stored.expires_at)
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
-        self._access_tokens.pop(token.token, None)
-        self._refresh_tokens.pop(token.token, None)
+        digest = self._digest(token.token)
+        self._access_tokens.pop(digest, None)
+        self._refresh_tokens.pop(digest, None)
+        self._save_state()
 
     def _issue_token(self, client_id: str, scopes: list[str]) -> OAuthToken:
         access_token = secrets.token_urlsafe(32)
         refresh_token = secrets.token_urlsafe(32)
-        expires_at = int(time.time()) + ACCESS_TOKEN_TTL_SECONDS
-        self._access_tokens[access_token] = AccessToken(
-            token=access_token, client_id=client_id, scopes=scopes, expires_at=expires_at
+        now = int(time.time())
+        self._access_tokens[self._digest(access_token)] = _StoredToken(
+            client_id, list(scopes), now + ACCESS_TOKEN_TTL_SECONDS
         )
-        self._refresh_tokens[refresh_token] = RefreshToken(
-            token=refresh_token, client_id=client_id, scopes=scopes
+        self._refresh_tokens[self._digest(refresh_token)] = _StoredToken(
+            client_id, list(scopes), now + REFRESH_TOKEN_TTL_SECONDS
         )
+        self._save_state()
         return OAuthToken(
             access_token=access_token,
             token_type="Bearer",
